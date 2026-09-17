@@ -12,7 +12,7 @@
 ## 最短上手
 
 ```bat
-py -m pip install --user --upgrade uitap
+pip install uitap
 ut init
 edit uitap.json
 ut status
@@ -115,6 +115,8 @@ ut init
 edit uitap.json
 ut doctor
 ```
+
+从 PyPI 安装（推荐）：`pip install uitap`；升级用 `pip install --upgrade uitap`。Windows 上 `pip` 未加入 `PATH` 时改用 `py -m pip install uitap`（macOS/Linux 用 `python3 -m pip`）。
 
 源码仓库安装（开发场景）：`py -m pip install --user --upgrade .`，Windows 上推荐 `py -m uitap`（不依赖 `Scripts` 目录是否加入 `PATH`）。真实 `uitap.json` 已被 Git 忽略，其中的密码、UDID 与内网地址不得提交；`init` 在检测到配置未被忽略时会主动警告。
 
