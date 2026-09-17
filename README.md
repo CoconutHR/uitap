@@ -1,5 +1,10 @@
 # uitap
 
+[![CI](https://github.com/CoconutHR/uitap/actions/workflows/ci.yml/badge.svg)](https://github.com/CoconutHR/uitap/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/uitap.svg)](https://pypi.org/project/uitap/)
+[![Python](https://img.shields.io/pypi/pyversions/uitap.svg)](https://pypi.org/project/uitap/)
+[![License](https://img.shields.io/pypi/l/uitap.svg)](LICENSE)
+
 **uiautomator2 式 iOS 设备自动化客户端。** `pip install uitap`，零运行时依赖（模板匹配的 Pillow 可选），通过设备端已有的 `9096` HTTP 服务与 `10102` 日志 WebSocket 提供截图、控件树、坐标操作、工程管理、OCR、日志与自动化能力。
 
 完整中文文档：[从零开始使用教程](docs/从零开始使用教程.md)、[API 使用参考](docs/API使用参考.md)、[生产使用指南](docs/生产使用指南.md)、[USB 隧道运维指南](docs/USB隧道运维指南.md)、[发布与验收流程](docs/发布与验收流程.md)、[变更说明](docs/变更说明.md)。
