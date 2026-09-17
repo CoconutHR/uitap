@@ -1,0 +1,215 @@
+# USB 隧道运维指南
+
+## 目的
+
+当电脑与 iPhone 不在同一局域网、Wi-Fi 受隔离或不希望使用手机热点时，可通过 USB 将电脑本机端口转发到 iPhone 上的设备端服务端口。uitap 使用外部 `iproxy` 完成该转发，并仍按普通 TCP 地址连接：
+
+```text
+uitap -> 127.0.0.1:9096 -> iproxy -> USB -> iPhone:9096
+```
+
+同一个 `tunnel` 命令默认还会启动日志回显端口的映射：
+
+```text
+uitap -> 127.0.0.1:10102 -> iproxy -> USB -> iPhone:10102
+```
+
+## 前提
+
+1. iPhone 已通过 USB 连接到该电脑并完成系统信任/配对。
+2. AScript 本地服务已在手机中开启。
+3. 电脑已安装受信任来源的 `iproxy`，并可从终端执行 `iproxy` 或在配置中给出其绝对路径。
+4. 本地 `9096`、`10102` 未被其他程序占用。
+
+uitap 不下载、安装或更新 `iproxy`。这避免客户端静默执行来源不明的原生二进制，也允许团队在受控环境中统一管理 libimobiledevice 版本。
+
+### Windows 安装与定位
+
+安装包含 `iproxy.exe` 的受信任 Windows libimobiledevice 发行版后，在命令提示符执行：
+
+```bat
+where iproxy
+iproxy --help
+```
+
+第一条命令能找到程序时，配置可保持 `"iproxy": "iproxy"`。若没有加入 `PATH`，填写可执行文件的绝对路径；JSON 中反斜杠必须写两次：
+
+```json
+{
+  "tunnel": {
+    "iproxy": "C:\\tools\\libimobiledevice\\iproxy.exe"
+  }
+}
+```
+
+### macOS 与 Linux 安装与定位
+
+macOS 可使用 Homebrew：
+
+```sh
+brew install libimobiledevice
+which iproxy
+iproxy --help
+```
+
+Linux 应通过发行版的受信任软件源安装 `libimobiledevice`，再执行：
+
+```sh
+command -v iproxy
+iproxy --help
+```
+
+若二进制不在 `PATH`，同样将绝对路径填入 `tunnel.iproxy`。不要将未知来源的下载文件直接加入自动化或 CI 环境。
+
+## 配置
+
+复制并编辑配置：
+
+```bat
+copy uitap.example.json uitap.json
+edit uitap.json
+```
+
+以上是 Windows 写法；macOS/Linux 使用 `cp uitap.example.json uitap.json` 并用任意文本编辑器打开文件。
+
+USB 使用时将 `device.address` 设为本机回环地址：
+
+```json
+{
+  "device": {
+    "address": "127.0.0.1:9096",
+    "password": "",
+    "timeout": 20,
+    "retries": 1
+  },
+  "tunnel": {
+    "iproxy": "iproxy",
+    "local_host": "127.0.0.1",
+    "local_port": 9096,
+    "remote_port": 9096,
+    "local_log_port": 10102,
+    "remote_log_port": 10102,
+    "forward_logs": true,
+    "udid": "",
+    "startup_timeout": 8
+  }
+}
+```
+
+`udid` 留空时由 `iproxy` 选择其默认设备。多设备环境必须填写 UDID，避免把测试命令转发到错误手机。`uitap.json` 已被 Git 忽略，不得提交密码、UDID 或内网信息。
+
+配置项对应关系：`device.address` 的主机与端口必须与 `tunnel.local_host`、`tunnel.local_port` 一致，否则命令会连到未被转发的地址。`local_host` 只允许 `127.0.0.1` 或 `localhost`；`startup_timeout` 是等待 `iproxy` 就绪的秒数，USB 链路较慢或设备较多时可适当增大。
+
+## CLI 使用
+
+本节命令沿用 `py -m uitap` 的 Windows 写法；macOS/Linux 替换为 `python3 -m uitap`，`Scripts` 目录已加入 `PATH` 时可直接用 `ut`。三种形式的完整说明见 [API 使用参考](API使用参考.md)的“CLI 参考 → 调用方式”。
+
+在一个专用终端中保持隧道运行：
+
+```bat
+py -m uitap tunnel
+```
+
+启动前或出现故障时，先运行只读诊断：
+
+```bat
+py -m uitap doctor --report artifacts\usb-doctor.json
+```
+
+它会分别报告 `iproxy`、本机 `9096/10102`、设备控制服务和日志端口。端口被占用时不会自动终止其他进程；缺少 `iproxy` 时不会自动下载安装。若已手工安装但未加入 `PATH`，可在审查路径后执行 `py -m uitap doctor --fix-iproxy "D:\\tools\\libimobiledevice\\iproxy.exe"`，再确认写入配置。
+
+成功后会显示（路由中 `service` 为控制端口映射，`logs` 为日志端口映射）：
+
+```text
+USB 隧道已启动：service=127.0.0.1:9096 -> device:9096; logs=127.0.0.1:10102 -> device:10102。请将 device.address 设置为 127.0.0.1:9096。按 Ctrl+C 停止。
+```
+
+在另一个终端中使用正常命令：
+
+```bat
+py -m uitap status
+py -m uitap shot artifacts\usb-screen.png
+py -m uitap inspect
+```
+
+USB 场景下 `inspect` 的两个地址都是回环地址，但含义不同：设备地址 `127.0.0.1:9096` 经 `iproxy` 转发到手机，Inspector 自身监听的 `127.0.0.1:<随机端口>` 是给本机浏览器访问的网页服务。前者由 `--device` 或配置文件指定，后者由 `inspect --host` / `--port` 指定，两者不要互相填错。
+
+临时覆盖配置：
+
+```bat
+py -m uitap tunnel --local-port 19096 --remote-port 9096 --local-log-port 11002 --remote-log-port 10102 --udid <UDID>
+py -m uitap --device 127.0.0.1:19096 status
+```
+
+这两条命令必须成对理解：`tunnel` 只负责建立端口映射，它**不会**同步修改 `device.address`。改了 `--local-port` 之后，所有业务命令都必须用全局 `--device 127.0.0.1:<新端口>` 指向新的本地端口，否则仍会连到配置文件里的旧地址。
+
+`tunnel` 可覆盖的参数与对应配置键如下（优先级为“命令行 > 配置文件 > 内置默认值”）：
+
+| 参数 | 配置键 | 默认值 | 作用 |
+| --- | --- | --- | --- |
+| `--local-port` | `tunnel.local_port` | `9096` | 本机控制端口，`device.address` 需与之一致 |
+| `--remote-port` | `tunnel.remote_port` | `9096` | 手机端设备服务 HTTP 端口 |
+| `--local-log-port` | `tunnel.local_log_port` | `10102` | 本机日志端口 |
+| `--remote-log-port` | `tunnel.remote_log_port` | `10102` | 手机端日志端口 |
+| `--no-logs` | `tunnel.forward_logs`（取反） | 转发日志 | 只映射控制端口 |
+| `--udid` | `tunnel.udid` | 空（由 `iproxy` 选默认设备） | 多设备时指定目标手机 |
+| `--iproxy` | `tunnel.iproxy` | `iproxy` | `iproxy` 可执行文件名或绝对路径 |
+
+**本机监听地址不可通过 CLI 修改。** `tunnel.local_host` 只接受 `127.0.0.1` 或 `localhost`，填入其他值会在启动前抛出 `local_host must be loopback for a USB tunnel`；这是有意的设计，参见下文“安全边界”。因此 USB 场景下 `device.address` 的主机部分只能是回环地址，需要变动的只有端口。
+
+多设备并行时，为每台手机分配互不冲突的本地端口，并各自固定 UDID：
+
+```bat
+py -m uitap tunnel --udid <UDID-A> --local-port 9096  --local-log-port 10102
+py -m uitap tunnel --udid <UDID-B> --local-port 19096 --local-log-port 11002
+py -m uitap --device 127.0.0.1:9096  status
+py -m uitap --device 127.0.0.1:19096 status
+```
+
+需要排查 HTTP 服务而不使用日志时，可传入 `--no-logs`。否则默认应保持 `forward_logs: true`，这样 `py -m uitap log`、`deploy --logs` 和 Python `client.logs()` 都会通过同一条 USB 连接工作。
+
+`tunnel` 在前台运行，按 `Ctrl+C`、向 uitap 进程发送 `SIGTERM` 或发生命令异常时，都会进入清理路径并终止由 uitap 启动的两个 `iproxy` 进程。客户端会在停止后等待本机转发端口重新可绑定，避免紧接着重启隧道时出现短暂端口冲突。不要把这些进程作为后台孤儿任务长期保留。
+
+## Python 使用
+
+```python
+from uitap import Tunnel, connect
+
+with Tunnel.from_config(udid="") as tunnel:   # 读取 uitap.json 的 tunnel 段
+    device = connect(tunnel.address)
+    print(device.client.status())
+```
+
+`from_config()` 与 CLI `tunnel` 命令读取同一份配置，优先级为“显式参数 > 配置文件 > 内置默认值”；`with` 退出（包括异常）时自动停止两条映射。配置文件不存在时退回内置默认值，不确定配置是否被读取时可用 `py -m uitap doctor` 检查。
+
+`Tunnel` 默认同时映射日志端口，因此日志无需额外处理：
+
+```python
+from uitap import Client, Tunnel
+
+with Tunnel.from_config():
+    client = Client("127.0.0.1:9096")
+    for entry in client.logs(duration=5):
+        print(entry.message)
+```
+
+高级调用可继续使用 `IProxyTunnel` 建立单个非标准端口映射。直接构造 `Tunnel(executable="...")` 不读取配置文件，字段名也与配置键不同（`executable` 对应 `iproxy`），仅适合完全显式控制的场景；从零开始教程的 5.3 节有完整的脚本示例。
+
+## 安全边界
+
+- `IProxyTunnel` 只接受 `127.0.0.1` 或 `localhost` 作为本地客户端地址；uitap 不提供将 USB 隧道绑定到局域网接口的选项。
+- 具体 `iproxy` 发行版的监听实现可能不同。生产设备应保持主机防火墙启用，并确认转发端口不对外暴露。
+- USB 隧道绕过了 Wi-Fi 网络隔离，但不绕过手机的配对信任、设备端服务开关或服务密码。
+- 隧道仅是传输层，`eval`、项目上传、删除和自动化动作的权限/确认规则仍然有效。
+
+## 故障排查
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| `未找到 iproxy 可执行文件` / `iproxy executable not found` | 未安装、未加入 PATH 或路径写错 | Windows 执行 `where iproxy`；macOS 执行 `which iproxy`；无结果则安装受信任发行版，或将 `tunnel.iproxy` 设为绝对路径 |
+| `iproxy exited during startup` | USB 未连接、设备未信任、端口冲突或 UDID 错误 | 重新插拔/解锁并信任设备；检查端口和 UDID |
+| 隧道运行但 `status` 失败 | 设备端服务未开启或远端端口不对 | 在手机确认服务；检查 `remote_port` 默认应为 `9096` |
+| `log` 失败 | 日志隧道被关闭、端口冲突或设备端日志服务不可用 | 移除 `--no-logs`，确认 `forward_logs` 为 `true`，检查本机 `10102` 与远端 `10102` |
+| 多设备连接到错误手机 | `udid` 留空 | 在配置中固定目标 UDID |
+
+隧道成功只说明本地端口已由 `iproxy` 接管；仍必须执行 `py -m uitap status` 验证设备端服务与目标 App 环境。

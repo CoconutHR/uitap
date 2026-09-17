@@ -1,0 +1,245 @@
+"""Managed local USB port forwarding through the external ``iproxy`` tool."""
+from __future__ import annotations
+
+import socket
+import subprocess
+import sys
+import time
+import warnings
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .config import load_config, tunnel_options
+from .errors import IProxyNotFoundError, TunnelError
+from .i18n import t
+
+
+def _iproxy_not_found_message(executable: str) -> str:
+    """Return an actionable message in the selected language."""
+    if sys.platform == "win32":
+        return t("iproxy_missing_windows", executable=repr(executable))
+    if sys.platform == "darwin":
+        return t("iproxy_missing_macos", executable=repr(executable))
+    return t("iproxy_missing_linux", executable=repr(executable))
+
+
+@dataclass
+class IProxyTunnel:
+    """通过 USB 将一个本机 TCP 端口映射到 iOS 设备端口。
+
+    ``iproxy`` is intentionally an explicit external dependency. It is the
+    portable libimobiledevice implementation of the USB multiplexing bridge;
+    uitap owns its process lifetime but does not bundle the binary.
+    """
+
+    local_port: int = 9096
+    remote_port: int = 9096
+    udid: str = ""
+    executable: str = "iproxy"
+    local_host: str = "127.0.0.1"
+    startup_timeout: float = 8.0
+    _process: subprocess.Popen[str] | None = field(init=False, default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        for name, value in (("local_port", self.local_port), ("remote_port", self.remote_port)):
+            if not isinstance(value, int) or not 1 <= value <= 65535: raise ValueError(f"{name} must be between 1 and 65535")
+        if self.local_host not in {"127.0.0.1", "localhost"}: raise ValueError("local_host must be loopback for a USB tunnel")
+        if self.startup_timeout <= 0: raise ValueError("startup_timeout must be positive")
+
+    @property
+    def address(self) -> str:
+        return f"{self.local_host}:{self.local_port}"
+
+    @property
+    def command(self) -> list[str]:
+        command = [self.executable]
+        if self.udid: command += ["-u", self.udid]
+        return command + [str(self.local_port), str(self.remote_port)]
+
+    @property
+    def is_running(self) -> bool:
+        return self._process is not None and self._process.poll() is None
+
+    def exit_detail(self) -> str:
+        """Return a short diagnostic after an exited child process."""
+        process = self._process
+        if process is None:
+            return "process was not started"
+        if process.poll() is None:
+            return "process is still running"
+        detail = ""
+        if process.stderr:
+            try:
+                detail = process.stderr.read().strip()
+            except OSError:
+                pass
+        return detail[-2000:] or f"exit code {process.returncode}"
+
+    def start(self) -> "IProxyTunnel":
+        if self.is_running: return self
+        try:
+            kwargs: dict[str, object] = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.PIPE, "text": True}
+            if sys.platform == "win32":
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            self._process = subprocess.Popen(self.command, **kwargs)
+        except FileNotFoundError as exc:
+            raise IProxyNotFoundError(_iproxy_not_found_message(self.executable)) from exc
+        except OSError as exc:
+            raise TunnelError(f"cannot start iproxy {self.command!r}: {exc}") from exc
+        deadline = time.monotonic() + self.startup_timeout
+        while time.monotonic() < deadline:
+            if self._process.poll() is not None:
+                detail = (self._process.stderr.read() if self._process.stderr else "").strip()
+                self._process = None
+                raise TunnelError(f"iproxy exited during startup ({detail or 'no stderr'})")
+            try:
+                with socket.create_connection((self.local_host, self.local_port), timeout=0.2):
+                    return self
+            except OSError:
+                time.sleep(0.1)
+        self.stop()
+        raise TunnelError(f"iproxy did not listen on {self.address} within {self.startup_timeout}s")
+
+    def stop(self) -> None:
+        process, self._process = self._process, None
+        if process is None or process.poll() is not None: return
+        process.terminate()
+        try: process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill(); process.wait(timeout=3)
+        self._wait_for_port_release()
+
+    def _wait_for_port_release(self, timeout: float = 2.0) -> None:
+        """Avoid a short OS socket-release race after stopping iproxy."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.bind((self.local_host, self.local_port))
+                return
+            except OSError:
+                time.sleep(0.05)
+
+    def __enter__(self) -> "IProxyTunnel": return self.start()
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        self.stop()
+        return False
+
+
+@dataclass
+class Tunnel:
+    """通过 USB 同时映射设备控制服务与可选日志服务。
+
+    This is the preferred USB tunnel for the device service: the HTTP service uses port
+    ``9096`` and the log WebSocket uses port ``10102``.  ``IProxyTunnel``
+    remains available when an application needs an individual custom mapping.
+    """
+
+    local_port: int = 9096
+    remote_port: int = 9096
+    local_log_port: int = 10102
+    remote_log_port: int = 10102
+    forward_logs: bool = True
+    udid: str = ""
+    executable: str = "iproxy"
+    local_host: str = "127.0.0.1"
+    startup_timeout: float = 8.0
+    service: IProxyTunnel = field(init=False)
+    logs: IProxyTunnel | None = field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.forward_logs, bool):
+            raise ValueError("forward_logs must be a boolean")
+        if self.forward_logs and self.local_port == self.local_log_port:
+            raise ValueError("local_port and local_log_port must differ when forwarding logs")
+        common = {
+            "udid": self.udid,
+            "executable": self.executable,
+            "local_host": self.local_host,
+            "startup_timeout": self.startup_timeout,
+        }
+        self.service = IProxyTunnel(self.local_port, self.remote_port, **common)
+        if self.forward_logs:
+            self.logs = IProxyTunnel(self.local_log_port, self.remote_log_port, **common)
+
+    # 配置文件键名到构造函数字段名的映射；iproxy 与 executable 例外。
+    _CONFIG_FIELDS = {
+        "iproxy": "executable",
+        "local_port": "local_port",
+        "remote_port": "remote_port",
+        "local_log_port": "local_log_port",
+        "remote_log_port": "remote_log_port",
+        "forward_logs": "forward_logs",
+        "udid": "udid",
+        "local_host": "local_host",
+        "startup_timeout": "startup_timeout",
+    }
+
+    @classmethod
+    def from_config(cls, path: str | Path | None = None, **overrides: Any) -> "Tunnel":
+        """从配置文件的 ``tunnel`` 段创建隧道；显式参数优先。
+
+        优先级为“显式参数 > 配置文件 > 内置默认值”；参数名与
+        ``uitap.json`` 的 ``tunnel`` 键一致（``iproxy``、``udid``、
+        端口等）。``path`` 指定配置文件，默认读取当前目录的
+        ``uitap.json``；文件不存在时退回内置默认值，不确定配置
+        是否被读取时可用 ``py -m uitap doctor`` 检查。过时别名
+        ``executable`` 等效 ``iproxy``，使用时会发出
+        ``DeprecationWarning``，将在后续版本移除。
+        """
+        if "executable" in overrides:
+            if "iproxy" in overrides: raise ValueError(t("tunnel_config_conflict"))
+            warnings.warn(t("tunnel_executable_deprecated"), DeprecationWarning, stacklevel=2)
+            overrides["iproxy"] = overrides.pop("executable")
+        unknown = sorted(set(overrides) - set(cls._CONFIG_FIELDS))
+        if unknown: raise ValueError(t("tunnel_config_unknown", keys=", ".join(unknown)))
+        config = tunnel_options(load_config(path))
+        options = {target: config[key] for key, target in cls._CONFIG_FIELDS.items() if key in config}
+        options.update({target: overrides[key] for key, target in cls._CONFIG_FIELDS.items() if key in overrides})
+        return cls(**options)
+
+    @property
+    def address(self) -> str:
+        """Local address used for normal device HTTP requests."""
+        return self.service.address
+
+    @property
+    def log_address(self) -> str | None:
+        """Local address of the device log WebSocket, when enabled."""
+        return self.logs.address if self.logs else None
+
+    @property
+    def is_running(self) -> bool:
+        return self.service.is_running and (self.logs is None or self.logs.is_running)
+
+    def exit_summary(self) -> str:
+        """Describe every mapping that stopped, including iproxy stderr when available."""
+        stopped: list[str] = []
+        for route, tunnel in (("service", self.service), ("logs", self.logs)):
+            if tunnel is not None and not tunnel.is_running:
+                stopped.append(t("tunnel_route_exited", route=route, address=tunnel.address, remote_port=tunnel.remote_port, detail=tunnel.exit_detail()))
+        return "; ".join(stopped) or "no stopped mapping was identified"
+
+    def start(self) -> "Tunnel":
+        self.service.start()
+        try:
+            if self.logs:
+                self.logs.start()
+        except Exception:
+            self.service.stop()
+            raise
+        return self
+
+    def stop(self) -> None:
+        if self.logs:
+            self.logs.stop()
+        self.service.stop()
+
+    def __enter__(self) -> "Tunnel":
+        return self.start()
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        self.stop()
+        return False

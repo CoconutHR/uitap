@@ -1,0 +1,20 @@
+{
+  "language": "auto",
+  "device": {
+    "address": "192.168.1.100:9096",
+    "password": "",
+    "timeout": 20,
+    "retries": 1
+  },
+  "tunnel": {
+    "iproxy": "iproxy",
+    "local_host": "127.0.0.1",
+    "local_port": 9096,
+    "remote_port": 9096,
+    "local_log_port": 10102,
+    "remote_log_port": 10102,
+    "forward_logs": true,
+    "udid": "",
+    "startup_timeout": 8
+  }
+}

@@ -1,0 +1,1397 @@
+import base64
+import json
+import socket
+import struct
+import tempfile
+import threading
+import time
+import unittest
+import zlib
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+from uitap import Client, Tunnel, Device, DeviceOperationError, DeviceResponseError, Run, UiObject, connect
+from uitap.cli import _stop_tunnel_on_sigterm, main
+from uitap.api.files import _project_file_paths
+from uitap.config import device_options, load_config, tunnel_options
+from uitap.core.png import png_size
+from uitap.doctor import DoctorCheck, _port_available, diagnose, save_report, set_iproxy_path
+from uitap.i18n import set_language
+from uitap.tunnel import _iproxy_not_found_message
+
+
+class Handler(BaseHTTPRequestHandler):
+    calls = []
+
+    def log_message(self, *args):
+        pass
+
+    def _body(self):
+        return self.rfile.read(int(self.headers.get("Content-Length", 0)))
+
+    def _reply(self, value, status=200, content_type="application/json"):
+        raw = value if isinstance(value, bytes) else json.dumps(value).encode()
+        self.send_response(status); self.send_header("Content-Type", content_type); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
+
+    def do_GET(self):
+        parsed = urlparse(self.path); Handler.calls.append(("GET", parsed.path, parse_qs(parsed.query), b""))
+        if parsed.path == "/api/screen/capture": return self._reply(b"PNG", content_type="image/png")
+        if parsed.path == "/api/screen/size": return self._reply({"code": 1, "data": {"width": 100, "height": 200}})
+        if parsed.path == "/api/node/dump": return self._reply(b"<App/>", content_type="application/xml")
+        if parsed.path == "/api/node/package": return self._reply({"code": 1, "data": {"name": "Example App", "bundle_id": "com.example.app", "pid": 42}})
+        if parsed.path == "/api/tool/view/dump": return self._reply({"code": 1, "data": {"config": {"display": {"widthPixels": 100, "heightPixels": 200}}, "views": [{"type": "XCUIElementTypeButton", "name": "confirm", "label": "Confirm", "x": 10, "y": 20, "width": 30, "height": 40, "childs": []}]}})
+        if parsed.path == "/api/module/create": return self._reply({"code": 1})
+        self._reply({"code": 1, "data": []})
+
+    def do_POST(self):
+        parsed = urlparse(self.path); body = self._body(); Handler.calls.append(("POST", parsed.path, parse_qs(parsed.query), body))
+        if parsed.path == "/api/model/pip": return self._reply(b"")
+        if parsed.path == "/api/gp/eval": return self._reply({"code": 1, "data": "true"})
+        if parsed.path == "/api/bad": return self._reply({"code": -1, "msg": "bad request"})
+        self._reply({"code": 1, "data": []})
+
+
+class ClientTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True); cls.thread.start()
+        cls.client = Client(f"127.0.0.1:{cls.server.server_port}", retries=0)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown(); cls.server.server_close()
+
+    def setUp(self):
+        Handler.calls.clear()
+        # 文案断言固定为英文，避免测试结果依赖操作系统语言。
+        set_language("en")
+        self.addCleanup(set_language, None)
+        # 坐标与 HID 能力缓存按测试隔离，避免跨用例泄漏尺寸或降级状态。
+        self.client._space_cache = None
+        self.client._hid_vision_available = None
+        self.client._vision_action_dimensions = None
+
+    def test_ping_screenshot_and_ui_xml(self):
+        self.assertEqual(self.client.ping(), "iOS")
+        self.assertEqual(self.client.screenshot(), b"PNG")
+        self.assertEqual(self.client.ui_xml(), "<App/>")
+
+    def test_relative_screenshot_crop_preserves_requested_pixels(self):
+        def chunk(kind, data):
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+        pixels = [bytes((x, y, 0, 255)) for y in range(4) for x in range(4)]
+        raw = b"".join(b"\0" + b"".join(pixels[row * 4:(row + 1) * 4]) for row in range(4))
+        header = struct.pack(">IIBBBBB", 4, 4, 8, 6, 0, 0, 0)
+        source = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+        crop = self.client.crop_png_relative(source, 0.25, 0.25, 0.75, 0.75)
+        self.assertEqual(png_size(crop), (2.0, 2.0))
+        self.assertIn(bytes((1, 1, 0, 255)), zlib.decompress(crop[crop.index(b"IDAT") + 4:-12]))
+        self.assertEqual(png_size(self.client.crop_png(source, 1, 1, 3, 3)), (2.0, 2.0))
+        with self.assertRaises(ValueError): self.client.crop_png(source, 1, 1, 5, 3)
+        original = self.client.screenshot
+        self.client.screenshot = lambda: source
+        try:
+            self.assertEqual(png_size(self.client.screenshot_crop(1, 1, 3, 3)), (2.0, 2.0))
+        finally:
+            self.client.screenshot = original
+        with self.assertRaises(ValueError): self.client.crop_png_relative(source, 0.8, 0.1, 0.2, 0.9)
+
+    def test_image_matching_honors_confidence_and_region(self):
+        from PIL import Image
+        from io import BytesIO
+        source = Image.new("RGB", (24, 20), "black")
+        template = Image.new("RGB", (4, 3), "black")
+        for y in range(3):
+            for x in range(4): template.putpixel((x, y), (20 + x * 30, 40 + y * 40, 180))
+        source.paste(template, (12, 8))
+        source_data, template_data = BytesIO(), BytesIO()
+        source.save(source_data, "PNG"); template.save(template_data, "PNG")
+        match = self.client._image_match(source_data.getvalue(), template_data.getvalue(), confidence=0.99, region=(0.4, 0.3, 0.9, 0.8))
+        self.assertIsNotNone(match)
+        self.assertEqual((match.x, match.y, match.width, match.height), (12, 8, 4, 3))
+        self.assertIsNone(self.client._image_match(source_data.getvalue(), template_data.getvalue(), confidence=0.99, region=(0, 0, 0.4, 0.3)))
+
+    def test_hid_vision_frame_maps_coordinates_without_changing_png_screenshot_contract(self):
+        from io import BytesIO
+        from PIL import Image
+
+        source = Image.new("RGB", (12, 10), "black")
+        template = Image.new("RGB", (3, 2), "black")
+        for y in range(2):
+            for x in range(3):
+                template.putpixel((x, y), (20 + x * 60, 40 + y * 80, 180))
+        source.paste(template, (6, 4))
+        jpeg, png, template_data = BytesIO(), BytesIO(), BytesIO()
+        source.save(jpeg, "JPEG", quality=100, subsampling=0)
+        source.save(png, "PNG")
+        with Image.open(BytesIO(jpeg.getvalue())) as decoded:
+            decoded.crop((6, 4, 9, 6)).save(template_data, "PNG")
+        calls = []
+        original_request, original_screenshot, original_action_size = self.client.request, self.client.screenshot, self.client.action_size
+        self.client.request = lambda method, path, **kwargs: calls.append(path) or json.dumps({"source": "hid", "value": base64.b64encode(jpeg.getvalue()).decode("ascii")}).encode()
+        self.client.screenshot = lambda: png.getvalue()
+        self.client.action_size = lambda: {"width": 24.0, "height": 20.0}
+        try:
+            match = self.client.find_image(template_data.getvalue(), confidence=0.9, region=(10, 6, 20, 16))
+            self.assertIsNotNone(match)
+            self.assertEqual((match.x, match.y, match.width, match.height), (12, 8, 6, 4))
+            # 公开 screenshot() 保持原有 PNG 字节语义，不被 HID JPEG 改写。
+            self.assertEqual(self.client.screenshot(), png.getvalue())
+        finally:
+            self.client.request, self.client.screenshot, self.client.action_size = original_request, original_screenshot, original_action_size
+        self.assertEqual(calls, ["/api/hid/screenshot"])
+
+    def test_hid_vision_failure_falls_back_to_png_and_is_cached_unavailable(self):
+        from io import BytesIO
+        from PIL import Image
+
+        png = BytesIO(); Image.new("RGB", (8, 6), "black").save(png, "PNG")
+        original_request, original_screenshot = self.client.request, self.client.screenshot
+        calls = []
+        def unavailable(method, path, **kwargs):
+            calls.append(path)
+            raise DeviceResponseError("HID unavailable")
+        self.client.request = unavailable
+        self.client.screenshot = lambda: png.getvalue()
+        try:
+            first, first_action = self.client._capture_vision_frame()
+            second, second_action = self.client._capture_vision_frame()
+        finally:
+            self.client.request, self.client.screenshot = original_request, original_screenshot
+        self.assertEqual((first.width, first.height), (8, 6))
+        self.assertEqual((second.width, second.height), (8, 6))
+        self.assertEqual(first_action, {"width": 8.0, "height": 6.0})
+        self.assertEqual(second_action, {"width": 8.0, "height": 6.0})
+        self.assertEqual(calls, ["/api/hid/screenshot"])
+
+    def test_exact_image_matching_keeps_png_capture_path(self):
+        from io import BytesIO
+        from PIL import Image
+
+        source = Image.new("RGB", (8, 6), "black")
+        source.putpixel((3, 2), (255, 0, 0))
+        image = BytesIO(); source.save(image, "PNG")
+        original_hid, original_screenshot = self.client._hid_vision_frame, self.client.screenshot
+        self.client._hid_vision_frame = lambda: self.fail("exact matching must not use HID JPEG")
+        self.client.screenshot = lambda: image.getvalue()
+        try:
+            self.assertIsNotNone(self.client.find_image(image.getvalue(), confidence=1.0))
+        finally:
+            self.client._hid_vision_frame, self.client.screenshot = original_hid, original_screenshot
+
+    def test_scroll_until_image_checks_before_each_directional_swipe(self):
+        original_find, original_swipe, original_relative = self.client.find_image, self.client.swipe_relative, self.client.relative_point
+        attempts, swipes = [], []
+        try:
+            self.client.find_image = lambda *args, **kwargs: attempts.append(1) or ({} if len(attempts) == 3 else None)
+            self.client.swipe_relative = lambda *args, **kwargs: swipes.append((args, kwargs))
+            self.client.relative_point = lambda *args: (1, 1)
+            result = self.client.scroll_until_image(b"template", direction="up", max_swipes=4, interval=0.001, initial_delay=False)
+        finally:
+            self.client.find_image, self.client.swipe_relative, self.client.relative_point = original_find, original_swipe, original_relative
+        self.assertEqual(result, {})
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(len(swipes), 2)
+        self.assertEqual(swipes[0][0], (0.5, 0.8, 0.5, 0.2))
+
+    def test_scroll_until_image_defaults_down_and_supports_horizontal_directions(self):
+        original_find, original_swipe, original_relative = self.client.find_image, self.client.swipe_relative, self.client.relative_point
+        swipes = []
+        try:
+            self.client.find_image = lambda *args, **kwargs: None
+            self.client.swipe_relative = lambda *args, **kwargs: swipes.append(args)
+            self.client.relative_point = lambda *args: (1, 1)
+            for direction in ("down", "left", "right", "上"):
+                with self.assertRaises(TimeoutError): self.client.scroll_until_image(b"template", direction=direction, max_swipes=1, timeout=1, initial_delay=False)
+        finally:
+            self.client.find_image, self.client.swipe_relative, self.client.relative_point = original_find, original_swipe, original_relative
+        self.assertEqual(swipes, [(0.5, 0.2, 0.5, 0.8), (0.8, 0.5, 0.2, 0.5), (0.2, 0.5, 0.8, 0.5), (0.5, 0.8, 0.5, 0.2)])
+
+    def test_scroll_until_image_accepts_custom_relative_swipe(self):
+        original_find, original_swipe, original_relative = self.client.find_image, self.client.swipe_relative, self.client.relative_point
+        swipes = []
+        try:
+            self.client.find_image = lambda *args, **kwargs: None
+            self.client.swipe_relative = lambda *args, **kwargs: swipes.append((args, kwargs))
+            self.client.relative_point = lambda *args: (1, 1)
+            with self.assertRaises(TimeoutError):
+                self.client.scroll_until_image(b"template", swipe_relative=(0.7, 0.75, 0.35, 0.25), duration_ms=650, max_swipes=1, initial_delay=False)
+            with self.assertRaises(ValueError): self.client.scroll_until_image(b"template", x1_ratio=0.5)
+            with self.assertRaises(ValueError): self.client.scroll_until_image(b"template", swipe_relative=(0.5, 0.5), initial_delay=False)
+        finally:
+            self.client.find_image, self.client.swipe_relative, self.client.relative_point = original_find, original_swipe, original_relative
+        self.assertEqual(swipes, [((0.7, 0.75, 0.35, 0.25), {"duration_ms": 650})])
+
+    def test_scroll_until_image_can_print_each_match_attempt(self):
+        original_find, original_relative = self.client.find_image, self.client.relative_point
+        output = StringIO()
+        try:
+            self.client.find_image = lambda *args, **kwargs: None
+            self.client.relative_point = lambda *args: (1, 1)
+            with redirect_stdout(output):
+                with self.assertRaises(TimeoutError): self.client.scroll_until_image(b"template", max_swipes=0, log=True, initial_delay=False)
+        finally:
+            self.client.find_image, self.client.relative_point = original_find, original_relative
+        self.assertIn("attempt 1", output.getvalue())
+
+    def test_image_wait_can_print_each_attempt(self):
+        original_find = self.client.find_image
+        output = StringIO()
+        try:
+            self.client.find_image = lambda *args, **kwargs: None
+            with redirect_stdout(output):
+                with self.assertRaises(TimeoutError): self.client.wait_image(b"template", timeout=0, log=True)
+        finally:
+            self.client.find_image = original_find
+        self.assertIn("attempt 1", output.getvalue())
+
+    def test_image_wait_delays_before_its_first_probe_by_default(self):
+        original_find = self.client.find_image
+        try:
+            self.client.find_image = lambda *args, **kwargs: {}
+            with patch("uitap.api.images.time.sleep") as sleep:
+                self.assertEqual(self.client.wait_image(b"template", timeout=5, interval=0.2), {})
+        finally:
+            self.client.find_image = original_find
+        sleep.assert_called_once_with(0.2)
+
+    def test_selector_wait_can_print_each_attempt(self):
+        device = Device(self.client)
+        original_find_all = device.find_all
+        output = StringIO()
+        try:
+            device.find_all = lambda selector, *, normalize=True: []
+            with redirect_stdout(output): self.assertIsNone(device.find(device.selector().name("missing"), timeout=0, log=True))
+        finally:
+            device.find_all = original_find_all
+        self.assertIn("attempt 1", output.getvalue())
+
+    def test_upload_builds_multipart_and_safe_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "main.py"; source.write_text("print(1)", encoding="utf-8")
+            self.client.upload_file("demo", source, "src/main.py")
+        upload = next(call for call in Handler.calls if call[1] == "/api/file/upload")
+        self.assertEqual(upload[2]["path"], ["~/modules/demo/src/main.py"])
+        self.assertIn(b"print(1)", upload[3])
+        with self.assertRaises(ValueError): self.client.upload_file("../bad", source)
+
+    def test_rename_remote_sends_bare_name_and_rejects_paths(self):
+        self.client.rename_remote("~/modules/demo/main.py", "entry.py")
+        call = next(call for call in Handler.calls if call[1] == "/api/file/rename")
+        self.assertEqual(call[2]["path"], ["~/modules/demo/main.py"])
+        self.assertEqual(call[2]["name"], ["entry.py"])
+        with self.assertRaises(ValueError): self.client.rename_remote("~/modules/demo/main.py", "src/entry.py")
+        with self.assertRaises(ValueError): self.client.rename_remote("~/modules/demo/main.py", "")
+
+    def test_device_helpers_encode_eval_calls_and_validate_keys(self):
+        captured: list[str] = []
+        original_eval = self.client.eval_python
+        self.client.eval_python = lambda code: (captured.append(code), True)[1]
+        try:
+            self.client.app_stop("com.example.app")
+            self.client.lock_screen()
+            self.client.unlock_screen()
+            self.client.set_clipboard("hello 中文")
+            self.client.open_url("uitap://demo")
+            self.client.press_key("volume_up")
+            self.client.dismiss_keyboard()
+        finally:
+            self.client.eval_python = original_eval
+        joined = "\n".join(captured)
+        self.assertIn("app_stop('com.example.app')", joined)
+        self.assertIn("system.lock()", joined)
+        self.assertIn("system.unlock()", joined)
+        self.assertIn("set_clipboard('hello 中文')", joined)
+        self.assertIn("open_url('uitap://demo')", joined)
+        self.assertIn("Keycode.VOLUME_UP", joined)
+        self.assertIn("keyboard_dismiss()", joined)
+        with self.assertRaises(ValueError): self.client.press_key("back")
+        with self.assertRaises(ValueError): self.client.app_start("")
+
+    def test_app_start_waits_for_foreground_or_times_out(self):
+        original_eval, original_current = self.client.eval_python, self.client.current_app
+        self.client.eval_python = lambda code: True
+        try:
+            self.client.current_app = lambda: {"bundle_id": "com.example.app"}
+            result = self.client.app_start("com.example.app")
+            self.assertEqual(result["bundle_id"], "com.example.app")
+            self.client.current_app = lambda: {"bundle_id": "com.other.app"}
+            with self.assertRaises(DeviceOperationError): self.client.app_start("com.example.app", timeout=0)
+        finally:
+            self.client.eval_python, self.client.current_app = original_eval, original_current
+
+    def test_app_state_trusts_current_app_over_wda_code(self):
+        cases = [
+            ({"code": 1, "current": "com.example.app"}, "foreground"),
+            ({"code": 1, "current": ""}, "not_running"),
+            ({"code": 2, "current": "com.other.app"}, "background"),
+        ]
+        original_eval = self.client.eval_python
+        try:
+            for payload, expected in cases:
+                self.client.eval_python = lambda code, payload=payload: payload
+                self.assertEqual(self.client.app_state("com.example.app")["state"], expected)
+            self.client.eval_python = lambda code: "garbage"
+            with self.assertRaises(DeviceResponseError): self.client.app_state("com.example.app")
+        finally:
+            self.client.eval_python = original_eval
+
+    def test_clipboard_and_orientation_validate_device_values(self):
+        original_eval = self.client.eval_python
+        try:
+            self.client.eval_python = lambda code: "landscape"
+            self.assertEqual(self.client.orientation(), "landscape")
+            self.client.eval_python = lambda code: "sideways"
+            with self.assertRaises(DeviceResponseError): self.client.orientation()
+            self.client.eval_python = lambda code: "copied text"
+            self.assertEqual(self.client.get_clipboard(), "copied text")
+        finally:
+            self.client.eval_python = original_eval
+
+    def test_element_text_and_scroll_encode_calls_and_validate(self):
+        captured: list[str] = []
+        original_eval = self.client.eval_python
+        self.client.eval_python = lambda code: (captured.append(code), "some text")[1]
+        try:
+            self.assertEqual(self.client.element_text("nid-1"), "some text")
+            self.client.element_scroll("nid-1", "up", 0.5)
+        finally:
+            self.client.eval_python = original_eval
+        joined = "\n".join(captured)
+        self.assertIn("Node(sc, 'nid-1').text", joined)
+        self.assertIn("scroll('up', 0.5)", joined)
+        with self.assertRaises(ValueError): self.client.element_scroll("nid-1", "diagonal")
+        with self.assertRaises(ValueError): self.client.element_scroll("nid-1", "down", 0)
+
+    def test_device_info_and_battery_normalize_values(self):
+        original_eval = self.client.eval_python
+        try:
+            self.client.eval_python = lambda code: {"model": "iPhone"} if "device_info" in code else {"level": "0.35", "state": "Charging: 2>"}
+            self.assertEqual(self.client.device_info(), {"model": "iPhone"})
+            battery = self.client.battery_info()
+            self.assertEqual(battery["level"], 0.35)
+            self.assertEqual(battery["state"], "charging")
+            self.client.eval_python = lambda code: {"level": 0.3, "state": "1"}
+            self.assertEqual(self.client.battery_info()["state"], "unplugged")
+            self.client.eval_python = lambda code: "garbage"
+            with self.assertRaises(DeviceResponseError): self.client.battery_info()
+        finally:
+            self.client.eval_python = original_eval
+
+    def test_open_notification_swipes_from_top_center(self):
+        original_size, original_swipe = self.client.action_size, self.client.swipe
+        self.client.action_size = lambda: {"width": 1000.0, "height": 2000.0}
+        calls: list[tuple[float, ...]] = []
+        self.client.swipe = lambda *coords, **kwargs: calls.append(coords)
+        try:
+            self.client.open_notification()
+        finally:
+            self.client.action_size, self.client.swipe = original_size, original_swipe
+        self.assertEqual(len(calls), 1)
+        x1, y1, x2, y2 = calls[0]
+        self.assertEqual((x1, x2), (500.0, 500.0))
+        self.assertEqual(y1, 3)
+        self.assertGreater(y2, 500)
+
+    def test_uio_get_text_and_scroll_delegate_with_node_id(self):
+        device = Device(self.client)
+        obj = UiObject(device, {"id": "nid-9", "x": 0, "y": 0, "width": 300, "height": 400}, device.selector())
+        captured: list[str] = []
+        original_eval = self.client.eval_python
+        self.client.eval_python = lambda code: (captured.append(code), "label text")[1]
+        try:
+            self.assertEqual(obj.get_text(), "label text")
+            obj.scroll("left", 0.5)
+        finally:
+            self.client.eval_python = original_eval
+        joined = "\n".join(captured)
+        self.assertIn("Node(sc, 'nid-9').text", joined)
+        self.assertIn("scroll('left', 0.5)", joined)
+        no_id = UiObject(device, {"x": 0, "y": 0, "width": 1, "height": 1}, device.selector())
+        with self.assertRaises(ValueError): no_id.get_text()
+
+    def test_uio_scroll_to_finds_target_within_swipes(self):
+        device = Device(self.client)
+        container = UiObject(device, {"id": "nid-9", "x": 0, "y": 0, "width": 300, "height": 400}, device.selector())
+        scrolls: list[tuple[str, float]] = []
+        original_scroll, original_find = self.client.element_scroll, device.find
+        self.client.element_scroll = lambda node_id, direction, distance: scrolls.append((direction, distance))
+        sentinel = object()
+        attempts = {"n": 0}
+        def fake_find(selector, *, timeout=0):
+            attempts["n"] += 1
+            return sentinel if attempts["n"] >= 3 else None
+        device.find = fake_find
+        try:
+            result = container.scroll_to(device.selector().name("target"), interval=0)
+        finally:
+            self.client.element_scroll, device.find = original_scroll, original_find
+        self.assertIs(result, sentinel)
+        self.assertEqual(len(scrolls), 2)
+        self.assertEqual(scrolls[0][0], "down")
+
+    def test_tap_jitter_and_random_click_encode(self):
+        captured: list[str] = []
+        original_eval, original_point = self.client.eval_python, self.client.relative_point
+        self.client.eval_python = lambda code: (captured.append(code), True)[1]
+        self.client.relative_point = lambda xr, yr: (xr * 1000, yr * 2000)
+        try:
+            self.client.tap(100, 200, jitter=5)
+            with self.assertRaises(ValueError): self.client.tap(1, 2, jitter=-1)
+            self.client.click_random(0, 0, 500, 800)
+            self.client.click_random_relative(0.1, 0.2, 0.3, 0.4)
+        finally:
+            self.client.eval_python, self.client.relative_point = original_eval, original_point
+        joined = "\n".join(captured)
+        self.assertIn("click(100, 200, 20, 5)", joined)
+        self.assertIn("click_random(0, 0, 500, 800, 20)", joined)
+        self.assertIn("click_random(100, 400, 300, 800, 20)", joined)
+
+    def test_slide_path_variants_encode_and_validate(self):
+        captured: list[str] = []
+        original_eval, original_point = self.client.eval_python, self.client.relative_point
+        self.client.eval_python = lambda code: (captured.append(code), True)[1]
+        self.client.relative_point = lambda xr, yr: (xr * 1000, yr * 2000)
+        try:
+            self.client.slide_path([(10, 20), (30, 40)], durations=[100], touch_down_duration=50)
+            self.client.slide_path_relative([(0.1, 0.1), (0.5, 0.5)])
+            with self.assertRaises(ValueError): self.client.slide_path([(1, 2)])
+        finally:
+            self.client.eval_python, self.client.relative_point = original_eval, original_point
+        joined = "\n".join(captured)
+        self.assertIn("slide_path(json.loads('[[10.0, 20.0], [30.0, 40.0]]'), duration=800, durations=[100], touch_down_duration=50, touch_up_duration=0)", joined)
+        self.assertIn("[[100.0, 200.0], [500.0, 1000.0]]", joined)
+
+    def test_touch_and_slide_variants_encode(self):
+        captured: list[str] = []
+        original_eval, original_point = self.client.eval_python, self.client.relative_point
+        self.client.eval_python = lambda code: (captured.append(code), True)[1]
+        self.client.relative_point = lambda xr, yr: (xr * 1000, yr * 2000)
+        try:
+            self.client.touch_and_slide(1, 2, 3, 4)
+            self.client.touch_and_slide_relative(0.1, 0.2, 0.3, 0.4)
+        finally:
+            self.client.eval_python, self.client.relative_point = original_eval, original_point
+        joined = "\n".join(captured)
+        self.assertIn("touch_and_slide(1, 2, 3, 4, 0.5, 1.0, 0.5)", joined)
+        self.assertIn("touch_and_slide(100.0, 400.0, 300.0, 800.0, 0.5, 1.0, 0.5)", joined)
+
+    def test_screen_cache_notify_find_sift_and_scan_code(self):
+        captured: list[str] = []
+        original_eval, original_size = self.client.eval_python, self.client.action_size
+        def fake_eval(code):
+            captured.append(code)
+            if "find_sift" in code: return [{"result": [1, 2], "confidence": 0.9}]
+            if "code_scanner" in code: return [{"value": "hi"}]
+            return True
+        self.client.eval_python = fake_eval
+        self.client.action_size = lambda: {"width": 1000.0, "height": 2000.0}
+        try:
+            self.client.screen_cache(True)
+            self.client.notify("done", title="stage", notification_id="id1")
+            hits = self.client.find_sift(["~/res/img/a.png"], threshold=0.8, region_relative=(0, 0, 0.5, 0.5))
+            codes = self.client.scan_code()
+        finally:
+            self.client.eval_python, self.client.action_size = original_eval, original_size
+        joined = "\n".join(captured)
+        self.assertIn("cache(True)", joined)
+        self.assertIn("oc.notify('done', 'stage', 'id1')", joined)
+        self.assertIn("capture(rect=(0, 0, 500, 1000))", joined)
+        self.assertIn("oc.find_sift(img, ['~/res/img/a.png'], threshold=0.8, rgb=False, max_res=0, offset_xy=(0, 0))", joined)
+        self.assertNotIn("\\\\", joined)
+        self.assertIn("oc.code_scanner(img, offset_x=0, offset_y=0)", joined)
+        self.assertEqual(hits[0]["confidence"], 0.9)
+        self.assertEqual(codes[0]["value"], "hi")
+        with self.assertRaises(ValueError): self.client.find_sift([])
+        with self.assertRaises(ValueError): self.client.find_sift(["a.png"], threshold=2)
+        with self.assertRaises(ValueError): self.client.scan_code(region=(0, 0, 1, 1), region_relative=(0, 0, 1, 1))
+
+    def test_yolov_lifecycle_encodes_and_validates(self):
+        captured: list[str] = []
+        original_eval, original_size = self.client.eval_python, self.client.action_size
+        def fake_eval(code):
+            captured.append(code)
+            if "yolov11.load" in code: return True
+            if "yolov11.detect" in code: return [{"class_id": 0, "confidence": 0.9, "rect": [1, 2, 3, 4], "tag": "enemy"}]
+            if "yolov11.nc" in code: return 80
+            return None
+        self.client.eval_python = fake_eval
+        self.client.action_size = lambda: {"width": 1000.0, "height": 2000.0}
+        try:
+            self.assertTrue(self.client.yolov_load("~/m/yolo.param", "~/m/yolo.bin", "~/m/data.yaml", use_gpu=True))
+            detections = self.client.yolov_detect(threshold=0.5, region_relative=(0.1, 0.2, 0.5, 0.6))
+            self.client.yolov_free()
+            self.assertEqual(self.client.yolov_nc(), 80)
+            self.client.yolov_detect()
+        finally:
+            self.client.eval_python, self.client.action_size = original_eval, original_size
+        joined = "\n".join(captured)
+        self.assertIn("yolov11.load('~/m/yolo.param', '~/m/yolo.bin', '~/m/data.yaml', use_gpu=True)", joined)
+        self.assertIn("detect(target_size=640, threshold=0.5, nms_threshold=0.5, rect=[100, 400, 500, 1200])", joined)
+        self.assertIn("yolov11.free()", joined)
+        self.assertIn("int(yolov11.nc())", joined)
+        self.assertIn("rect=None", joined)
+        self.assertEqual(detections[0]["tag"], "enemy")
+        with self.assertRaises(ValueError): self.client.yolov_detect(threshold=2)
+        with self.assertRaises(ValueError): self.client.yolov_detect(nms_threshold=-1)
+        with self.assertRaises(ValueError): self.client.yolov_load("", "~/m/yolo.bin")
+
+    def test_eval_actions_are_encoded(self):
+        self.client.input_text("a'\n中文")
+        call = next(call for call in Handler.calls if call[1] == "/api/gp/eval")
+        self.assertIn(b"ascript.ios.action", call[3])
+
+    def test_relative_coordinates_scale_and_remain_in_screen_bounds(self):
+        original_json, original_tap, original_screenshot = self.client.json, self.client.tap, self.client.screenshot
+        self.client.json = lambda method, path, **kwargs: {"code": 1, "data": {"width": 393, "height": 852}} if path == "/api/screen/size" else original_json(method, path, **kwargs)
+        try:
+            self.client.screenshot = lambda: b"\x89PNG\r\n\x1a\n" + b"\0\0\0\rIHDR" + (1179).to_bytes(4, "big") + (2556).to_bytes(4, "big")
+            self.assertEqual(self.client.screen_size(), {"width": 1179.0, "height": 2556.0})
+            self.assertEqual(self.client.relative_point(0.5, 0.92), (589.5, 2351.52))
+            self.assertEqual(self.client.relative_point(1, 1), (1178.0, 2555.0))
+            tapped = []
+            self.client.tap = lambda x, y, **kwargs: tapped.append((x, y, kwargs))
+            Device(self.client).click_rel(0.5, 0.92, duration_ms=30)
+        finally:
+            self.client.json, self.client.tap, self.client.screenshot = original_json, original_tap, original_screenshot
+        self.assertEqual(tapped, [(589.5, 2351.52, {"duration_ms": 30, "jitter": 0})])
+        with self.assertRaises(ValueError): self.client.relative_point(-0.1, 0.5)
+        with self.assertRaises(ValueError): self.client.relative_point(float("nan"), 0.5)
+
+    def test_ui_tree_coordinates_are_normalized_to_action_pixels(self):
+        original_screenshot = self.client.screenshot
+        try:
+            self.client.screenshot = lambda: b"\x89PNG\r\n\x1a\n" + b"\0\0\0\rIHDR" + (300).to_bytes(4, "big") + (600).to_bytes(4, "big")
+            tree = self.client.ui_tree(x=150, y=300)
+        finally:
+            self.client.screenshot = original_screenshot
+        node = tree["views"][0]
+        self.assertEqual((node["x"], node["y"], node["width"], node["height"]), (30.0, 60.0, 90.0, 120.0))
+        self.assertEqual(tree["config"]["display"]["widthPixels"], 300.0)
+        lookup = next(call for call in Handler.calls if call[1] == "/api/tool/view/dump")
+        self.assertEqual(lookup[2]["x"], ["50.0"])
+        self.assertEqual(lookup[2]["y"], ["100.0"])
+
+    def test_operation_error(self):
+        with self.assertRaises(DeviceOperationError): self.client._ok({"code": -1, "msg": "bad request"})
+
+    def test_status_falls_back_when_the_device_reports_a_status_error(self):
+        original, original_screenshot = self.client.json, self.client.screenshot
+        def fake_json(method, path, **kwargs):
+            if path == "/api/status": return {"code": -1, "msg": "ObjCStrInstance object is not callable"}
+            if path == "/api/screen/size": return {"code": 1, "data": {"width": 100, "height": 200}}
+            if path == "/api/node/package": return {"code": 1, "data": {"bundle_id": "example"}}
+            return original(method, path, **kwargs)
+        try:
+            self.client.json = fake_json
+            self.client.screenshot = lambda: b"\x89PNG\r\n\x1a\n" + b"\0\0\0\rIHDR" + (300).to_bytes(4, "big") + (600).to_bytes(4, "big")
+            status = self.client.status()
+        finally:
+            self.client.json, self.client.screenshot = original, original_screenshot
+        self.assertTrue(status["available"])
+        self.assertEqual(status["health"], "degraded")
+        self.assertEqual(status["compatibility"]["status_api"]["issue"], "ios_objc_property_callable")
+        self.assertEqual(status["compatibility"]["capabilities"]["screen"], "available")
+        self.assertEqual(status["screen"]["width"], 300)
+        self.assertEqual(status["logical_screen"]["width"], 100)
+
+    def test_status_backfills_readonly_fields_via_eval_when_degraded(self):
+        original_json, original_screenshot, original_eval = self.client.json, self.client.screenshot, self.client.eval_python
+        def fake_json(method, path, **kwargs):
+            if path == "/api/status": return {"code": -1, "msg": "'ObjCStrInstance' object is not callable"}
+            if path == "/api/screen/size": return {"code": 1, "data": {"width": 100, "height": 200}}
+            if path == "/api/node/package": return {"code": 1, "data": {"bundle_id": "example"}}
+            return original_json(method, path, **kwargs)
+        def fake_eval(code):
+            self.assertIn("languageCode", code)
+            return {"device": {"model": "iPhone15,2"}, "system": {"language": "zh"}}
+        try:
+            self.client.json = fake_json
+            self.client.screenshot = lambda: b"\x89PNG\r\n\x1a\n" + b"\0\0\0\rIHDR" + (300).to_bytes(4, "big") + (600).to_bytes(4, "big")
+            self.client.eval_python = fake_eval
+            status = self.client.status()
+        finally:
+            self.client.json, self.client.screenshot, self.client.eval_python = original_json, original_screenshot, original_eval
+        self.assertEqual(status["device"]["model"], "iPhone15,2")
+        self.assertEqual(status["system"]["language"], "zh")
+        self.assertEqual(status["compatibility"]["status_api"]["compensated_fields"], ["device", "system"])
+        self.assertIn("eval", status["compatibility"]["status_api"]["message"])
+
+    def test_status_stays_degraded_without_backfill_when_eval_fails(self):
+        original_json, original_screenshot, original_eval = self.client.json, self.client.screenshot, self.client.eval_python
+        def fake_json(method, path, **kwargs):
+            if path == "/api/status": return {"code": -1, "msg": "'ObjCStrInstance' object is not callable"}
+            if path == "/api/screen/size": return {"code": 1, "data": {"width": 100, "height": 200}}
+            if path == "/api/node/package": return {"code": 1, "data": {"bundle_id": "example"}}
+            return original_json(method, path, **kwargs)
+        def broken_eval(code):
+            raise DeviceOperationError("eval endpoint unavailable")
+        try:
+            self.client.json = fake_json
+            self.client.screenshot = lambda: b"\x89PNG\r\n\x1a\n" + b"\0\0\0\rIHDR" + (300).to_bytes(4, "big") + (600).to_bytes(4, "big")
+            self.client.eval_python = broken_eval
+            status = self.client.status()
+        finally:
+            self.client.json, self.client.screenshot, self.client.eval_python = original_json, original_screenshot, original_eval
+        self.assertEqual(status["health"], "degraded")
+        self.assertNotIn("device", status)
+        self.assertNotIn("compensated_fields", status["compatibility"]["status_api"])
+
+    def test_packages_uses_eval_when_status_has_no_package_list(self):
+        original_status, original_eval = self.client.status, self.client.eval_python
+        self.client.status = lambda: {"available": True}
+        self.client.eval_python = lambda code: [["numpy", "1.0"], ["requests", "2.0"]]
+        self.assertEqual(self.client.packages(), [["numpy", "1.0"], ["requests", "2.0"]])
+        self.client.status, self.client.eval_python = original_status, original_eval
+
+    def test_project_file_paths_support_ios_childs_and_nested_directories(self):
+        tree = {"name": "demo", "isFile": False, "childs": [
+            {"name": "res", "isFile": False, "childs": [
+                {"name": "img", "isFile": False, "childs": [{"name": "logo.png", "isFile": True}]}
+            ]},
+            {"name": "__init__.py", "isFile": True},
+        ]}
+        self.assertEqual(_project_file_paths(tree), ["__init__.py", "res/img/logo.png"])
+
+    def test_uiautomator_style_device_selector_resolves_and_clicks(self):
+        device = Device(self.client)
+        button = device(text="Confirm", class_name="XCUIElementTypeButton")
+        self.assertTrue(button.exists)
+        self.assertEqual(button.count, 1)
+        self.assertEqual(button.info["name"], "confirm")
+        original_screenshot = self.client.screenshot
+        self.client.screenshot = lambda: b"\x89PNG\r\n\x1a\n" + b"\0\0\0\rIHDR" + (300).to_bytes(4, "big") + (600).to_bytes(4, "big")
+        try: button.click()
+        finally: self.client.screenshot = original_screenshot
+        lookup = next(call for call in Handler.calls if call[1] == "/api/tool/view/dump")
+        selector = json.loads(lookup[2]["selector"][0])
+        self.assertEqual(selector["sel"][0], {"key": "label", "params": "Confirm"})
+        action = next(call for call in Handler.calls if call[1] == "/api/gp/eval")[3]
+        self.assertIn(b"ascript.ios.action", action)
+        self.assertIn(b"click%2875.0%2C+120.0", action)
+
+    def test_connect_returns_a_device_facade(self):
+        self.assertIsInstance(connect(f"127.0.0.1:{self.server.server_port}", retries=0), Device)
+
+    def test_json_configuration_is_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "uitap.json"
+            path.write_text('{"device": {"address": "127.0.0.1:9096", "timeout": 20}}', encoding="utf-8")
+            self.assertEqual(device_options(load_config(path))["address"], "127.0.0.1:9096")
+            path.write_text("[]", encoding="utf-8")
+            with self.assertRaises(ValueError): load_config(path)
+
+    def test_tunnel_configuration_and_command(self):
+        options = tunnel_options({"tunnel": {"iproxy": "custom-iproxy", "local_port": 19096, "remote_port": 9096, "local_log_port": 11002, "remote_log_port": 10102, "forward_logs": True, "udid": "abc"}})
+        tunnel = Tunnel(**{"local_port": int(options["local_port"]), "remote_port": int(options["remote_port"]), "local_log_port": int(options["local_log_port"]), "remote_log_port": int(options["remote_log_port"]), "forward_logs": options["forward_logs"], "udid": options["udid"], "executable": options["iproxy"]})
+        self.assertEqual(tunnel.address, "127.0.0.1:19096")
+        self.assertEqual(tunnel.log_address, "127.0.0.1:11002")
+        self.assertEqual(tunnel.service.command, ["custom-iproxy", "-u", "abc", "19096", "9096"])
+        self.assertEqual(tunnel.logs.command if tunnel.logs else None, ["custom-iproxy", "-u", "abc", "11002", "10102"])
+        self.assertIsNone(Tunnel(forward_logs=False).log_address)
+
+    def test_tunnel_from_config_reads_the_tunnel_section(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "uitap.json"
+            path.write_text(json.dumps({"tunnel": {"iproxy": "custom-iproxy", "local_port": 19096, "udid": "abc", "unknown": "ignored"}}), encoding="utf-8")
+            tunnel = Tunnel.from_config(path)
+            self.assertEqual(tunnel.address, "127.0.0.1:19096")
+            self.assertEqual(tunnel.service.command, ["custom-iproxy", "-u", "abc", "19096", "9096"])
+            # 显式参数优先于配置文件；未覆盖的键继续沿用配置。
+            overridden = Tunnel.from_config(path, udid="device-b", local_port=29096)
+            self.assertEqual(overridden.service.command, ["custom-iproxy", "-u", "device-b", "29096", "9096"])
+            # 配置文件不存在时退回内置默认值。
+            self.assertEqual(Tunnel.from_config(Path(directory) / "missing.json").address, "127.0.0.1:9096")
+
+    def test_tunnel_from_config_supports_and_rejects_parameter_aliases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "uitap.json"
+            path.write_text('{"tunnel": {"iproxy": "custom-iproxy", "local_port": 19096, "udid": "abc"}}', encoding="utf-8")
+            # 过时别名 executable 仍可用，但发出弃用警告。
+            with self.assertWarns(DeprecationWarning):
+                aliased = Tunnel.from_config(path, executable="alias-iproxy")
+            self.assertEqual(aliased.service.command, ["alias-iproxy", "-u", "abc", "19096", "9096"])
+            with self.assertRaises(ValueError): Tunnel.from_config(path, executable="a", iproxy="b")
+            with self.assertRaises(ValueError): Tunnel.from_config(path, unknown=1)
+
+    def test_missing_iproxy_message_is_actionable_on_windows(self):
+        set_language("zh-CN")
+        try:
+            with patch("uitap.tunnel.sys.platform", "win32"):
+                message = _iproxy_not_found_message("iproxy")
+        finally:
+            set_language("en")
+        self.assertIn("未找到 iproxy", message)
+        self.assertIn("where iproxy", message)
+        self.assertIn("iproxy.exe", message)
+        self.assertIn("tunnel.iproxy", message)
+
+    def test_chinese_help_does_not_require_a_device(self):
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            status = main(["--lang", "zh-CN", "help"])
+        self.assertEqual(status, 0)
+        self.assertIn("uitap 使用帮助", stdout.getvalue())
+        self.assertIn("doctor", stdout.getvalue())
+
+    def test_scan_command_is_removed(self):
+        with self.assertRaises(SystemExit):
+            main(["scan"])
+
+    def test_doctor_can_write_only_a_validated_iproxy_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "iproxy.exe"
+            executable.write_bytes(b"test")
+            config = root / "uitap.json"
+            config.write_text('{"device": {"address": "127.0.0.1:9096"}}', encoding="utf-8")
+            target = set_iproxy_path(load_config(config), str(executable), path=config)
+            saved = load_config(target)
+            self.assertEqual(saved["tunnel"]["iproxy"], str(executable.resolve()))
+            with self.assertRaises(ValueError):
+                set_iproxy_path(saved, str(root / "missing.exe"), path=config)
+
+    def test_doctor_report_omits_password(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = save_report([DoctorCheck("device", "ok", "reachable")], Path(directory) / "doctor.json", client=Client("127.0.0.1:9096", password="secret"))
+            value = report.read_text(encoding="utf-8")
+            self.assertIn('"device"', value)
+            self.assertNotIn("secret", value)
+
+    def test_doctor_detects_an_occupied_port(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            self.assertFalse(_port_available("127.0.0.1", occupied.getsockname()[1]))
+
+    def test_doctor_recognizes_ports_used_by_an_active_local_tunnel(self):
+        with patch("uitap.doctor._port_available", return_value=False):
+            checks = diagnose(self.client, {"tunnel": {"local_port": 19096, "local_log_port": 11002}})
+        ports = {check.name: check for check in checks if check.name in {"service_port", "log_port"}}
+        self.assertEqual(ports["service_port"].status, "ok")
+        self.assertEqual(ports["service_port"].detail, "active_local_tunnel")
+        self.assertEqual(ports["log_port"].status, "ok")
+
+    def test_sigterm_handler_enters_cleanup_path(self):
+        with self.assertRaises(KeyboardInterrupt):
+            _stop_tunnel_on_sigterm(15, None)
+
+    def test_tunnel_stop_waits_for_local_port_release(self):
+        class Process:
+            def __init__(self): self.terminated = False
+            def poll(self): return None
+            def terminate(self): self.terminated = True
+            def wait(self, timeout): return 0
+        tunnel = Tunnel(forward_logs=False).service
+        process = Process()
+        tunnel._process = process
+        with patch.object(tunnel, "_wait_for_port_release") as released:
+            tunnel.stop()
+        self.assertTrue(process.terminated)
+        released.assert_called_once_with()
+
+    def test_cli_requires_yes_for_state_changes(self):
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            status = main(["--device", f"127.0.0.1:{self.server.server_port}", "remove", "demo"])
+        self.assertEqual(status, 1)
+        self.assertIn("--yes", stderr.getvalue())
+        self.assertFalse(any(call[1] == "/api/module/remove" for call in Handler.calls))
+
+    def test_capture_artifacts_saves_available_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = self.client.capture_artifacts(directory)
+            self.assertEqual(artifacts["screenshot"].read_bytes(), b"PNG")
+            self.assertEqual(artifacts["xml"].read_text(encoding="utf-8"), "<App/>")
+            self.assertTrue(artifacts["context"].is_file())
+
+    def test_run_records_steps_and_failure_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with Run(Device(self.client), directory, run_id="unit-run") as run:
+                element = run.assert_unique(Device(self.client).selector().name("confirm"), name="confirm_is_unique")
+                self.assertEqual(element.info["name"], "confirm")
+                with self.assertRaises(RuntimeError): run.step("expected_failure", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+            manifest = json.loads((Path(directory) / "unit-run" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["outcome"], "passed")
+            self.assertEqual(manifest["steps"][1]["outcome"], "failed")
+            self.assertTrue((Path(directory) / "unit-run" / "expected_failure_failure.json").is_file())
+
+    def test_run_label_keeps_unicode_and_sanitizes_unsafe_characters(self):
+        from uitap.ui.run import _label
+        self.assertEqual(_label("填写用户名"), "填写用户名")
+        self.assertEqual(_label("打开/登录: 第二步"), "打开_登录_第二步")
+        self.assertEqual(_label("step 1."), "step_1")
+        self.assertEqual(_label("///"), "step")
+
+    def test_cli_accepts_yes_after_the_subcommand(self):
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            status = main(["--device", f"127.0.0.1:{self.server.server_port}", "remove", "demo", "--yes"])
+        self.assertEqual(status, 0)
+        self.assertTrue(any(call[1] == "/api/module/remove" for call in Handler.calls))
+
+    def test_help_documents_every_cli_command(self):
+        from argparse import _SubParsersAction
+        from uitap.cli import _HELP, _parser
+        choices = next(action.choices for action in _parser()._actions if isinstance(action, _SubParsersAction))
+        self.assertEqual(set(choices), set(_HELP))
+
+    def test_inspector_serves_a_loopback_snapshot(self):
+        from uitap.inspector import serve
+        server = serve(self.client, open_browser=False)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            with urlopen(f"http://127.0.0.1:{server.server_port}/", timeout=2) as response:
+                page = response.read().decode("utf-8")
+            self.assertIn('id="appmeta"', page)
+            self.assertIn('id="coordinate"', page)
+            self.assertIn('id="divider-left"', page)
+            self.assertIn("uitap 控件检查器", page)
+            self.assertIn("框选区域", page)
+            self.assertIn("保存 PNG", page)
+            self.assertIn("snapshot_id", page)
+            self.assertIn("freezeReady", page)
+            self.assertIn("setScreenImage", page)
+            self.assertIn("验证选择器", page)
+            with urlopen(f"http://127.0.0.1:{server.server_port}/api/snapshot", timeout=2) as response:
+                snapshot = json.loads(response.read())
+            self.assertEqual(snapshot["tree"]["views"][0]["name"], "confirm")
+            self.assertEqual(snapshot["coordinate_space"], {"width": 100, "height": 200})
+            self.assertEqual(snapshot["app"]["bundle_id"], "com.example.app")
+            self.assertEqual(base64.b64decode(snapshot["image"]), b"PNG")
+            selector = quote(json.dumps({"sel": [{"key": "name", "params": "confirm"}], "find": 99999}))
+            with urlopen(f"http://127.0.0.1:{server.server_port}/api/selector?selector={selector}", timeout=2) as response:
+                self.assertEqual(json.loads(response.read())["count"], 1)
+        finally:
+            server.shutdown(); server.server_close()
+
+    def test_inspector_crops_a_frozen_png_and_writes_metadata(self):
+        from io import BytesIO
+        from PIL import Image
+        from uitap.inspector import serve
+
+        source_image = Image.new("RGBA", (4, 3), (0, 0, 0, 255))
+        source_image.putpixel((1, 1), (12, 34, 56, 255))
+        source_image.putpixel((2, 2), (78, 90, 123, 255))
+        source_data = BytesIO(); source_image.save(source_data, "PNG")
+        source = source_data.getvalue()
+        original_screenshot = self.client.screenshot
+        self.client.screenshot = lambda: source
+        with tempfile.TemporaryDirectory() as directory:
+            server = serve(self.client, open_browser=False, output_dir=directory)
+            thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+            try:
+                with urlopen(f"http://127.0.0.1:{server.server_port}/api/snapshot", timeout=2) as response:
+                    snapshot = json.loads(response.read())
+                self.assertEqual(base64.b64decode(snapshot["image"]), source)
+                self.assertTrue(snapshot["snapshot_id"])
+                request = Request(
+                    f"http://127.0.0.1:{server.server_port}/api/crop",
+                    data=json.dumps({"snapshot_id": snapshot["snapshot_id"], "rect": {"left": 1, "top": 1, "right": 3, "bottom": 3}}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request, timeout=2) as response:
+                    result = json.loads(response.read())
+                saved, metadata_path = Path(result["path"]), Path(result["metadata_path"])
+                self.assertEqual(saved.parent, Path(directory).resolve())
+                self.assertEqual(png_size(saved.read_bytes()), (2.0, 2.0))
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                self.assertEqual(metadata["source_snapshot_id"], snapshot["snapshot_id"])
+                self.assertEqual(metadata["source_size"], {"width": 4, "height": 3})
+                self.assertEqual(metadata["region"], {"left": 1, "top": 1, "right": 3, "bottom": 3, "width": 2, "height": 2, "center": {"x": 2.0, "y": 2.0}})
+                self.assertEqual(metadata["region_relative"], {"left": 0.25, "top": 1 / 3, "right": 0.75, "bottom": 1.0})
+                missing = Request(
+                    f"http://127.0.0.1:{server.server_port}/api/crop",
+                    data=json.dumps({"snapshot_id": "missing", "rect": {"left": 1, "top": 1, "right": 3, "bottom": 3}}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as expired:
+                    urlopen(missing, timeout=2)
+                self.assertEqual(expired.exception.code, 404)
+                invalid = Request(
+                    f"http://127.0.0.1:{server.server_port}/api/crop",
+                    data=json.dumps({"snapshot_id": snapshot["snapshot_id"], "rect": {"left": 3, "top": 1, "right": 1, "bottom": 3}}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as bad_rect:
+                    urlopen(invalid, timeout=2)
+                self.assertEqual(bad_rect.exception.code, 400)
+                boolean_rect = Request(
+                    f"http://127.0.0.1:{server.server_port}/api/crop",
+                    data=json.dumps({"snapshot_id": snapshot["snapshot_id"], "rect": {"left": True, "top": 1, "right": 3, "bottom": 3}}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as bad_type:
+                    urlopen(boolean_rect, timeout=2)
+                self.assertEqual(bad_type.exception.code, 400)
+                with patch("uitap.inspector.server._MAX_SNAPSHOTS", 1):
+                    with urlopen(f"http://127.0.0.1:{server.server_port}/api/snapshot", timeout=2) as response:
+                        evicted = json.loads(response.read())
+                    with urlopen(f"http://127.0.0.1:{server.server_port}/api/snapshot", timeout=2):
+                        pass
+                    evicted_request = Request(
+                        f"http://127.0.0.1:{server.server_port}/api/crop",
+                        data=json.dumps({"snapshot_id": evicted["snapshot_id"], "rect": {"left": 1, "top": 1, "right": 3, "bottom": 3}}).encode(),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with self.assertRaises(HTTPError) as evicted_snapshot:
+                        urlopen(evicted_request, timeout=2)
+                    self.assertEqual(evicted_snapshot.exception.code, 404)
+            finally:
+                server.shutdown(); server.server_close(); self.client.screenshot = original_screenshot
+
+    def test_frame_pixel_colors_and_relative_coordinates_share_one_screenshot(self):
+        from io import BytesIO
+        from PIL import Image
+        image = Image.new("RGBA", (4, 3), (0, 0, 0, 255)); image.putpixel((1, 1), (12, 34, 56, 78))
+        output = BytesIO(); image.save(output, "PNG")
+        original = self.client.screenshot; calls = []
+        self.client.screenshot = lambda: calls.append(1) or output.getvalue()
+        try:
+            frame = self.client.capture_frame()
+            color = frame.pixel(1, 1)
+            self.assertEqual(color.rgb, (12, 34, 56))
+            self.assertEqual(color.rgba, (12, 34, 56, 78))
+            self.assertEqual(color.hex, "#0C2238")
+            self.assertEqual(frame.pixel_relative(0.25, 1 / 3).rgb, (12, 34, 56))
+            self.assertEqual(self.client.pixels([(1, 1), (0, 0)])[0].hex, "#0C2238")
+        finally:
+            self.client.screenshot = original
+        self.assertEqual(len(calls), 2)
+
+    def test_multi_template_matching_uses_one_frame_and_each_region(self):
+        from io import BytesIO
+        from PIL import Image
+        image = Image.new("RGB", (16, 12), "black")
+        red = Image.new("RGB", (2, 2), "red"); blue = Image.new("RGB", (2, 2), "blue")
+        image.paste(red, (2, 3)); image.paste(blue, (11, 7))
+        source, red_data, blue_data = BytesIO(), BytesIO(), BytesIO()
+        image.save(source, "PNG"); red.save(red_data, "PNG"); blue.save(blue_data, "PNG")
+        original = self.client.screenshot; calls = []
+        self.client.screenshot = lambda: calls.append(1) or source.getvalue()
+        try:
+            matches = self.client.find_images({"red": red_data.getvalue(), "blue": blue_data.getvalue()}, confidence=1, regions_relative={"red": (0, 0, .5, .7), "blue": (.5, .5, 1, 1)})
+            self.assertEqual((matches["red"].x, matches["red"].y), (2, 3))
+            self.assertEqual((matches["blue"].x, matches["blue"].y), (11, 7))
+            self.assertEqual(self.client.find_any_image({"blue": blue_data.getvalue(), "red": red_data.getvalue()}, confidence=1)[0], "blue")
+        finally:
+            self.client.screenshot = original
+        self.assertEqual(len(calls), 2)
+
+    def test_tree_uses_protocol_scale_for_retina_coordinates(self):
+        original_json, original_screenshot = self.client.json, self.client.screenshot
+        def fake_json(method, path, **kwargs):
+            if path == "/api/screen/size": return {"code": 1, "data": {"width": 393, "height": 852}}
+            if path == "/api/tool/view/dump": return {"code": 1, "data": {"config": {"scale": 3, "display": {"widthPixels": 393, "heightPixels": 852}}, "views": [{"name": "button", "x": 20, "y": 63, "width": 353, "height": 36, "rect": {"left": 20, "top": 63, "right": 373, "bottom": 99}, "childs": []}]}}
+            return original_json(method, path, **kwargs)
+        try:
+            self.client.json = fake_json
+            self.client.screenshot = lambda: b"\x89PNG\r\n\x1a\n" + b"\0\0\0\rIHDR" + (1179).to_bytes(4, "big") + (2556).to_bytes(4, "big")
+            tree = self.client.ui_tree(x=300, y=600)
+        finally:
+            self.client.json, self.client.screenshot = original_json, original_screenshot
+        node = tree["views"][0]
+        self.assertEqual((node["x"], node["y"], node["width"], node["height"]), (60.0, 189.0, 1059.0, 108.0))
+        self.assertEqual((node["rect"]["left"], node["rect"]["right"]), (60.0, 1119.0))
+
+    def test_ui_snapshot_queries_relationships_without_extra_requests(self):
+        original = self.client.ui_tree; calls = []
+        self.client.ui_tree = lambda **kwargs: calls.append(kwargs) or {"views": [{"name": "root", "childs": [{"name": "left", "label": "A", "childs": [{"name": "deep", "childs": []}]}, {"name": "right", "label": "B", "childs": []}]}]}
+        try:
+            device = Device(self.client); snapshot = device.snapshot()
+            left = snapshot(name="left")
+            self.assertEqual(left.child(device.selector().name("deep")).count, 1)
+            self.assertEqual(left.descendant(device.selector().name("deep")).count, 1)
+            self.assertEqual(left.sibling(device.selector().name("right")).count, 1)
+            self.assertEqual(left.parent(device.selector().name("root")).count, 1)
+            self.assertEqual(device(name="left").snapshot().count, 1)
+        finally:
+            self.client.ui_tree = original
+        self.assertEqual(len(calls), 2)
+
+    def test_template_path_cache_reloads_when_file_changes(self):
+        from io import BytesIO
+        from PIL import Image
+        screen = Image.new("RGB", (8, 8), "black"); screen.paste(Image.new("RGB", (2, 2), "red"), (3, 3))
+        screen_data = BytesIO(); screen.save(screen_data, "PNG")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "template.png"
+            Image.new("RGB", (2, 2), "red").save(path)
+            from uitap import ScreenFrame
+            image = ScreenFrame(screen_data.getvalue())
+            self.assertIsNotNone(image.find_image(path, confidence=1))
+            Image.new("RGB", (2, 2), "blue").save(path)
+            self.assertIsNone(image.find_image(path, confidence=1))
+
+    def test_template_matching_confirms_all_pixels_after_sparse_prefilter(self):
+        from io import BytesIO
+        from PIL import Image
+        from uitap import ScreenFrame
+        screen = Image.new("RGB", (10, 10), "black")
+        template = Image.new("RGB", (10, 10), "black"); template.putpixel((2, 2), (255, 0, 0))
+        screen_data, template_data = BytesIO(), BytesIO(); screen.save(screen_data, "PNG"); template.save(template_data, "PNG")
+        self.assertIsNone(ScreenFrame(screen_data.getvalue()).find_image(template_data.getvalue(), confidence=.999))
+
+    def test_template_matching_sparse_prefilter_does_not_reject_valid_full_score(self):
+        from io import BytesIO
+        from PIL import Image
+        from uitap import ScreenFrame
+
+        template = Image.new("RGB", (16, 16), "black")
+        screen = template.copy()
+        screen.putpixel((0, 0), (255, 255, 255))
+        screen_data, template_data = BytesIO(), BytesIO()
+        screen.save(screen_data, "PNG")
+        template.save(template_data, "PNG")
+        match = ScreenFrame(screen_data.getvalue()).find_image(template_data.getvalue(), confidence=0.99)
+        self.assertIsNotNone(match)
+        self.assertGreaterEqual(match.confidence, 0.99)
+
+    def test_template_matching_uses_full_pixel_threshold_and_best_score(self):
+        from io import BytesIO
+        from PIL import Image
+        from uitap import ScreenFrame
+        template = Image.new("RGB", (2, 2), "black"); template.putpixel((0, 0), (20, 30, 40))
+        screen = Image.new("RGB", (6, 2), "black"); near = template.copy(); near.putpixel((1, 1), (60, 30, 40)); screen.paste(near, (0, 0)); screen.paste(template, (4, 0))
+        screen_data, template_data = BytesIO(), BytesIO(); screen.save(screen_data, "PNG"); template.save(template_data, "PNG")
+        frame = ScreenFrame(screen_data.getvalue())
+        self.assertEqual((frame.find_image(template_data.getvalue(), confidence=.99).x, frame.find_image(template_data.getvalue(), confidence=.99).y), (4, 0))
+        self.assertIsNone(frame.find_image(template_data.getvalue(), confidence=1, region=(0, 0, 2, 2)))
+
+    def test_template_matching_keeps_scan_order_for_equal_scores(self):
+        from io import BytesIO
+        from PIL import Image
+        from uitap import ScreenFrame
+        template = Image.new("RGB", (2, 2), (20, 30, 40))
+        screen = Image.new("RGB", (8, 2), "black"); screen.paste(template, (1, 0)); screen.paste(template, (5, 0))
+        screen_data, template_data = BytesIO(), BytesIO(); screen.save(screen_data, "PNG"); template.save(template_data, "PNG")
+        match = ScreenFrame(screen_data.getvalue()).find_image(template_data.getvalue(), confidence=1)
+        self.assertEqual((match.x, match.y), (1, 0))
+        frame = ScreenFrame(screen_data.getvalue())
+        self.assertEqual((frame.find_image(template_data.getvalue(), confidence=1, region=(0, 0, 3, 2)).x, 0), (1, 0))
+        self.assertIsNone(frame.find_image(template_data.getvalue(), confidence=1, region=(2, 0, 5, 2)))
+
+    def test_template_matching_ignores_alpha_and_cache_is_thread_safe(self):
+        from io import BytesIO
+        from PIL import Image
+        from uitap import ScreenFrame
+        from uitap.vision import frame
+        screen = Image.new("RGBA", (4, 4), (0, 0, 0, 255)); screen.paste(Image.new("RGBA", (2, 2), (12, 34, 56, 255)), (1, 1))
+        template = Image.new("RGBA", (2, 2), (12, 34, 56, 0)); screen_data, template_data = BytesIO(), BytesIO(); screen.save(screen_data, "PNG"); template.save(template_data, "PNG")
+        match = ScreenFrame(screen_data.getvalue()).find_image(template_data.getvalue(), confidence=1)
+        self.assertEqual((match.x, match.y), (1, 1))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "template.png"; template.save(path)
+            with frame._TEMPLATE_CACHE_LOCK: frame._TEMPLATE_CACHE.clear()
+            errors = []
+            def find():
+                try: ScreenFrame(screen_data.getvalue()).find_image(path, confidence=1)
+                except Exception as exc: errors.append(exc)
+            threads = [threading.Thread(target=find) for _ in range(12)]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join()
+            self.assertEqual(errors, [])
+            with frame._TEMPLATE_CACHE_LOCK:
+                self.assertEqual(len(frame._TEMPLATE_CACHE), 1)
+                self.assertTrue(next(iter(frame._TEMPLATE_CACHE.values())).samples)
+
+    def test_find_any_image_stops_after_first_match(self):
+        calls = []
+        class Frame:
+            width, height = 1, 1
+            def find_image(self, template, **kwargs):
+                calls.append(template)
+                return object() if template == "first" else None
+        original = self.client.capture_frame; self.client.capture_frame = lambda: Frame()
+        try:
+            self.assertEqual(self.client.find_any_image({"one": "first", "two": "second"})[0], "one")
+        finally:
+            self.client.capture_frame = original
+        self.assertEqual(calls, ["first"])
+
+    def test_wait_any_image_returns_matching_name(self):
+        from io import BytesIO
+        from PIL import Image
+        source = Image.new("RGB", (8, 8), "black"); source.paste(Image.new("RGB", (2, 2), "green"), (4, 4))
+        source_data, green_data, red_data = BytesIO(), BytesIO(), BytesIO()
+        source.save(source_data, "PNG"); Image.new("RGB", (2, 2), "green").save(green_data, "PNG"); Image.new("RGB", (2, 2), "red").save(red_data, "PNG")
+        original = self.client.screenshot; self.client.screenshot = lambda: source_data.getvalue()
+        try:
+            name, match = self.client.wait_any_image({"missing": red_data.getvalue(), "found": green_data.getvalue()}, confidence=1, timeout=0, initial_delay=False)
+        finally:
+            self.client.screenshot = original
+        self.assertEqual(name, "found")
+        self.assertEqual((match.x, match.y), (4, 4))
+
+    def test_wait_any_uses_one_full_snapshot_per_attempt_and_regex_stays_local(self):
+        original = self.client.ui_tree; calls = []
+        self.client.ui_tree = lambda **kwargs: calls.append(kwargs) or {"views": [{"name": "root", "childs": [{"name": "success_42", "label": "完成", "childs": []}]}]}
+        try:
+            device = Device(self.client)
+            name, element = device.wait_any({"failure": device.selector().name("failure"), "success": device.selector().name("success_42")}, timeout=0)
+            self.assertEqual(name, "success")
+            self.assertEqual(element.info["name"], "success_42")
+            self.assertEqual(device.snapshot()(name="root").descendant().where_regex("name", r"success_\d+").count, 1)
+        finally:
+            self.client.ui_tree = original
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["mode"], "full")
+
+    def test_wait_interval_is_configurable_and_validated(self):
+        device = Device(self.client)
+        with self.assertRaises(ValueError): device.find(device.selector().name("missing"), interval=0)
+        with self.assertRaises(ValueError): device.wait_gone(device.selector().name("missing"), interval=0)
+
+    def test_coordinate_api_pairs_and_snapshot_index_keep_tree_order(self):
+        original_tree, original_tap, original_size = self.client.ui_tree, self.client.tap, self.client.action_size
+        self.client.ui_tree = lambda **kwargs: {"views": [{"name": "root", "x": 0, "y": 0, "width": 100, "height": 200, "childs": [{"name": "button", "type": "Button", "label": "A", "x": 10, "y": 20, "width": 30, "height": 40, "childs": []}, {"name": "button", "type": "Button", "label": "B", "x": 50, "y": 60, "width": 20, "height": 30, "childs": []}]}]}
+        taps = []; self.client.tap = lambda x, y, **kwargs: taps.append((x, y, kwargs))
+        try:
+            device = Device(self.client); snapshot = device.snapshot()
+            self.assertEqual([item.info["label"] for item in snapshot(name="button").all()], ["A", "B"])
+            self.assertEqual(snapshot.select(device.selector().at(15, 25)).info["label"], "A")
+            self.client.action_size = lambda: {"width": 100, "height": 200}
+            self.assertEqual(snapshot.select(device.selector().at_relative(.15, .125)).info["label"], "A")
+            element = snapshot(name="button").get(); element.object.click_relative(1, 1)
+            self.assertEqual(taps[0][:2], (39.0, 59.0))
+            self.assertTrue(hasattr(device, "tap")); self.assertTrue(hasattr(device, "screenshot_crop"))
+        finally:
+            self.client.ui_tree, self.client.tap, self.client.action_size = original_tree, original_tap, original_size
+
+    def test_empty_element_rectangles_and_absolute_image_regions_are_validated(self):
+        device = Device(self.client)
+        with self.assertRaises(ValueError):
+            UiObject(device, {"x": 0, "y": 0, "width": 0, "height": 0}, device.selector()).click()
+        from io import BytesIO
+        from PIL import Image
+        screen, template = Image.new("RGB", (8, 8), "black"), Image.new("RGB", (2, 2), "red")
+        screen.paste(template, (4, 4)); source, needle = BytesIO(), BytesIO(); screen.save(source, "PNG"); template.save(needle, "PNG")
+        original = self.client.screenshot; self.client.screenshot = lambda: source.getvalue()
+        try:
+            self.assertEqual(self.client.wait_image(needle.getvalue(), confidence=1, timeout=0, initial_delay=False, region_pixels=(4, 4, 8, 8)).center, (5.0, 5.0))
+            with self.assertRaises(ValueError): self.client.wait_image(needle.getvalue(), timeout=0, initial_delay=False, region=(0, 0, 1, 1), region_pixels=(0, 0, 8, 8))
+        finally:
+            self.client.screenshot = original
+
+    def test_image_region_uses_pixels_and_legacy_relative_inputs_warn(self):
+        from io import BytesIO
+        from PIL import Image
+        source = Image.new("RGB", (10, 10), "black"); template = Image.new("RGB", (2, 2), "red"); source.paste(template, (6, 6))
+        source_data, template_data = BytesIO(), BytesIO(); source.save(source_data, "PNG"); template.save(template_data, "PNG")
+        from uitap import ScreenFrame
+        frame = ScreenFrame(source_data.getvalue())
+        self.assertEqual((frame.find_image(template_data.getvalue(), confidence=1, region=(5, 5, 10, 10)).x, frame.find_image(template_data.getvalue(), confidence=1, region=(5, 5, 10, 10)).y), (6, 6))
+        self.assertEqual((frame.find_image(template_data.getvalue(), confidence=1, region_relative=(.5, .5, 1, 1)).x, frame.find_image(template_data.getvalue(), confidence=1, region_relative=(.5, .5, 1, 1)).y), (6, 6))
+        with self.assertWarns(DeprecationWarning):
+            self.assertIsNotNone(frame.find_image(template_data.getvalue(), confidence=1, region=(.5, .5, 1., 1.)))
+        with self.assertWarns(DeprecationWarning):
+            self.assertIsNotNone(frame.find_image(template_data.getvalue(), confidence=1, region_pixels=(5, 5, 10, 10)))
+        self.assertIsNone(frame.find_image(template_data.getvalue(), confidence=1, region=(0, 0, 1, 1)))
+        with self.assertRaises(ValueError):
+            frame.find_image(template_data.getvalue(), confidence=1, region=(5, 5, 10, 10), region_relative=(.5, .5, 1, 1))
+
+    def test_duration_seconds_and_milliseconds_normalize_without_conflicts(self):
+        self.assertEqual(self.client._duration_ms(.65, None, default_ms=20), 650)
+        self.assertEqual(self.client._duration_ms(None, 650, default_ms=20), 650)
+        self.assertEqual(self.client._duration_ms(None, None, default_ms=20), 20)
+        with self.assertRaises(ValueError): self.client._duration_ms(.1, 100, default_ms=20)
+        with self.assertRaises(ValueError): self.client._duration_ms(-.1, None, default_ms=20)
+        calls = []; original = self.client.eval_python
+        self.client.eval_python = lambda code, **kwargs: calls.append(code) or True
+        try:
+            self.client.tap(1, 2, duration=.65)
+            self.client.drag(1, 2, 3, 4, duration=.5)
+        finally:
+            self.client.eval_python = original
+        self.assertIn("click(1, 2, 650, 0)", calls[0])
+        self.assertIn("slide(1, 2, 3, 4, 500)", calls[1])
+
+    def test_pixel_color_parsing_and_region_assertions(self):
+        from io import BytesIO
+        from PIL import Image
+        from uitap import PixelColor, ScreenFrame
+        self.assertEqual(PixelColor.parse("#0C2238").rgb, (12, 34, 56))
+        self.assertEqual(PixelColor.parse("#0C22384E").rgba, (12, 34, 56, 78))
+        self.assertEqual(PixelColor.parse((12, 34, 56)).hex, "#0C2238")
+        image = Image.new("RGBA", (4, 4), (12, 34, 56, 255)); data = BytesIO(); image.save(data, "PNG"); frame = ScreenFrame(data.getvalue())
+        self.assertTrue(frame.color_matches(0, 0, "#0C2238"))
+        self.assertTrue(frame.color_matches(0, 0, (13, 35, 57), tolerance=1))
+        self.assertEqual(frame.find_color("#0C2238", region=(0, 0, 4, 4)), (0, 0))
+        self.assertEqual(frame.count_color("#0C2238", region_relative=(0, 0, 1, 1)), 16)
+        self.assertEqual(frame.assert_color(0, 0, PixelColor(12, 34, 56)).hex, "#0C2238")
+
+    def test_structured_ocr_and_current_app_wait(self):
+        original_gp, original_app = self.client.gp, self.client.current_app
+        payload = {"data": [{"text": "登录", "rect": [10, 20, 30, 40], "confidence": .9}]}
+        self.client.gp = lambda *args, **kwargs: json.dumps(payload)
+        self.client.current_app = lambda: {"bundle_id": "com.example.app"}
+        try:
+            result = self.client.ocr()
+            self.assertEqual(result.items[0].text, "登录")
+            self.assertEqual(result.items[0].rect, (10, 20, 30, 40))
+            self.assertEqual(self.client.find_ocr_text("登录")[0].confidence, .9)
+            self.assertEqual(self.client.wait_current_app("com.example.app")["bundle_id"], "com.example.app")
+        finally:
+            self.client.gp, self.client.current_app = original_gp, original_app
+
+    def test_click_if_unique_is_atomic_and_reports_nonunique(self):
+        device = Device(self.client); original_find = device.find_all; clicks = []
+        button = UiObject(device, {"x": 10, "y": 20, "width": 30, "height": 40}, device.selector().name("submit"))
+        original_tap = self.client.tap; self.client.tap = lambda *args, **kwargs: clicks.append((args, kwargs))
+        try:
+            device.find_all = lambda selector, *, normalize=True: [button]
+            self.assertIs(device.click_if_unique(device.selector().name("submit")), button)
+            self.assertEqual(clicks[0][0], (25.0, 40.0))
+            device.find_all = lambda selector, *, normalize=True: [button, button]
+            with self.assertRaises(LookupError): device.click_if_unique(device.selector().name("submit"))
+        finally:
+            device.find_all, self.client.tap = original_find, original_tap
+
+    def test_cli_duration_units_preserve_milliseconds_and_accept_seconds(self):
+        from uitap.cli import _parser
+        old = _parser().parse_args(["tap", "1", "2", "--duration", "450"])
+        explicit_ms = _parser().parse_args(["tap", "1", "2", "--duration-ms", "450"])
+        seconds = _parser().parse_args(["tap", "1", "2", "--duration-s", ".45"])
+        self.assertEqual((old.duration, old.duration_ms, old.duration_s), (450, None, None))
+        self.assertEqual((explicit_ms.duration, explicit_ms.duration_ms, explicit_ms.duration_s), (None, 450, None))
+        self.assertEqual((seconds.duration, seconds.duration_ms, seconds.duration_s), (None, None, .45))
+        with self.assertRaises(SystemExit): _parser().parse_args(["tap", "1", "2", "--duration", "450", "--duration-s", ".45"])
+
+    def test_coordinate_cache_and_normalize_fast_path_reduce_requests(self):
+        original_json, original_screenshot = self.client.json, self.client.screenshot
+        size_calls, capture_calls = [], []
+        def fake_json(method, path, **kwargs):
+            if path == "/api/screen/size": size_calls.append(1); return {"code": 1, "data": {"width": 393, "height": 852}}
+            return original_json(method, path, **kwargs)
+        try:
+            self.client.json = fake_json
+            self.client.screenshot = lambda: capture_calls.append(1) or b"\x89PNG\r\n\x1a\n" + b"\0\0\0\rIHDR" + (1179).to_bytes(4, "big") + (2556).to_bytes(4, "big")
+            self.client.ui_tree()                       # 冷启动：size + 截图 + 树
+            self.client.ui_tree()                       # 命中缓存：只有树请求
+            self.client.ui_tree(normalize=False)        # 快速路径：只有树请求，且无 x/y
+            fast = [call for call in Handler.calls if call[1] == "/api/tool/view/dump"][-1]
+        finally:
+            self.client.json, self.client.screenshot = original_json, original_screenshot
+        self.assertEqual(len(size_calls), 1)
+        self.assertEqual(len(capture_calls), 1)
+        self.assertEqual(len([call for call in Handler.calls if call[1] == "/api/tool/view/dump"]), 3)
+        self.assertNotIn("x", fast[2])
+        with self.assertRaises(ValueError): self.client.ui_tree(x=5, normalize=False)
+        self.client.coordinate_cache_ttl = 0
+        self.client._space_cache = None
+
+    def test_exists_and_count_use_the_fast_path_without_coordinates(self):
+        device = Device(self.client); calls = []
+        original = device.find_all
+        device.find_all = lambda selector, *, normalize=True: calls.append(normalize) or []
+        try:
+            self.assertFalse(device(name="missing").exists)
+            self.assertEqual(device(name="missing").count, 0)
+            self.assertTrue(device(name="missing").wait_gone(timeout=0))
+        finally:
+            device.find_all = original
+        self.assertEqual(set(calls), {False})
+
+    def test_scroll_until_element_returns_match_and_swipes_when_missing(self):
+        device = Device(self.client); original_tree, original_swipe = self.client.ui_tree, self.client.swipe_relative
+        trees = [
+            {"views": [{"name": "header", "childs": []}]},
+            {"views": [{"name": "header", "childs": []}]},
+            {"views": [{"name": "target_button", "childs": []}]},
+        ]
+        swipes = []
+        self.client.ui_tree = lambda **kwargs: trees.pop(0)
+        self.client.swipe_relative = lambda *args, **kwargs: swipes.append((args, kwargs))
+        try:
+            found = device.scroll_until_element(device.selector().name("target_button"), interval=0.001, initial_delay=False)
+            self.assertEqual(found.info["name"], "target_button")
+            swipes_before = len(swipes)
+            trees.extend([{"views": []}] * 3)
+            with self.assertRaises(LookupError):
+                device.scroll_until_element({"a": device.selector().name("x"), "b": device.selector().name("y")}, max_swipes=2, interval=0.001, initial_delay=False)
+            self.assertEqual(len(swipes) - swipes_before, 2)
+            self.assertEqual(swipes[0][0], (0.5, 0.2, 0.5, 0.8))
+        finally:
+            self.client.ui_tree, self.client.swipe_relative = original_tree, original_swipe
+
+    def test_watcher_clicks_matching_elements_and_stops(self):
+        device = Device(self.client); original_tree = self.client.ui_tree
+        clicks = []; original_tap = self.client.tap
+        self.client.tap = lambda *args, **kwargs: clicks.append(args)
+        self.client.ui_tree = lambda **kwargs: {"views": [{"name": "popup", "x": 10, "y": 20, "width": 30, "height": 40, "childs": []}]}
+        try:
+            with device.watch(device.selector().name("popup"), interval=0.05, log=False) as watcher:
+                deadline = time.monotonic() + 3
+                while watcher.trigger_count == 0 and time.monotonic() < deadline: time.sleep(0.02)
+            self.assertEqual(clicks, [(25.0, 40.0)])
+            self.assertEqual(watcher.triggered, ["rule_0"])
+            self.assertFalse(watcher.is_running)
+            self.assertEqual(watcher.errors, [])
+        finally:
+            self.client.ui_tree, self.client.tap = original_tree, original_tap
+
+    def test_ocr_text_matching_calls_ocr_once_per_query(self):
+        from uitap import OcrItem, OcrResult
+
+        calls = []
+        original = self.client.ocr
+        self.client.ocr = lambda **kwargs: calls.append(kwargs) or OcrResult((OcrItem("Sign in", None, None, {}), OcrItem("Sign", None, None, {})), {})
+        try:
+            self.assertEqual([item.text for item in self.client.find_ocr_text("Sign")], ["Sign in", "Sign"])
+            self.assertEqual([item.text for item in self.client.find_ocr_text("Sign", contains=False)], ["Sign"])
+        finally:
+            self.client.ocr = original
+        self.assertEqual(len(calls), 2)
+
+    def test_logs_zero_duration_does_not_connect_and_non_object_json_is_raw_text(self):
+        class FakeWebSocket:
+            def __init__(self):
+                self.messages = [(0x1, b"[]"), None]
+                self.closed = False
+                self.close_code = 1000
+
+            def settimeout(self, timeout):
+                pass
+
+            def receive(self):
+                return self.messages.pop(0)
+
+            def close(self):
+                self.closed = True
+
+        websocket = FakeWebSocket()
+        with patch("uitap.api.logs.WebSocket.connect", return_value=websocket) as connect_socket:
+            self.assertEqual(list(self.client.logs(duration=0)), [])
+            connect_socket.assert_not_called()
+            entries = list(self.client.logs())
+        self.assertEqual([entry.message for entry in entries], ["[]"])
+        self.assertTrue(websocket.closed)
+
+    def test_inspector_ignores_a_closed_browser_socket(self):
+        from uitap.inspector import serve
+        server = serve(self.client, open_browser=False)
+        handler = object.__new__(server.RequestHandlerClass)
+        handler.send_response = lambda *args: None
+        handler.send_header = lambda *args: None
+        handler.end_headers = lambda: None
+        class ClosedWriter:
+            def write(self, value): raise ConnectionAbortedError("browser closed")
+        handler.wfile = ClosedWriter()
+        self.assertFalse(handler._send(200, b"snapshot", "text/plain"))
+        server.server_close()
+
+
+if __name__ == "__main__":
+    unittest.main()
