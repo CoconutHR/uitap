@@ -1135,6 +1135,34 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(name, "found")
         self.assertEqual((match.x, match.y), (4, 4))
 
+    def test_multi_template_region_arguments_apply_per_name_and_as_default(self):
+        from io import BytesIO
+        from PIL import Image
+        image = Image.new("RGB", (16, 12), "black"); image.paste(Image.new("RGB", (2, 2), "green"), (11, 7))
+        source, green = BytesIO(), BytesIO()
+        image.save(source, "PNG"); Image.new("RGB", (2, 2), "green").save(green, "PNG")
+        original = self.client.screenshot; self.client.screenshot = lambda: source.getvalue()
+        try:
+            # 按模板名称映射：区域排除命中点时不命中，包含时命中。
+            self.assertIsNone(self.client.find_any_image({"g": green.getvalue()}, confidence=1, regions_relative={"g": (0, 0, .5, .7)}))
+            self.assertEqual(self.client.find_any_image({"g": green.getvalue()}, confidence=1, regions_relative={"g": (.5, .5, 1, 1)})[0], "g")
+            # 单数 region：作为全部模板共用的默认区域，绝对像素与比例两种写法都生效。
+            self.assertIsNone(self.client.find_any_image({"g": green.getvalue()}, confidence=1, region=(0, 0, 8, 6)))
+            self.assertEqual(self.client.find_any_image({"g": green.getvalue()}, confidence=1, region=(10, 6, 16, 12))[0], "g")
+            self.assertIsNone(self.client.find_any_image({"g": green.getvalue()}, confidence=1, region_relative=(0, 0, .5, .7)))
+            self.assertEqual(self.client.find_any_image({"g": green.getvalue()}, confidence=1, region_relative=(.5, .5, 1, 1))[0], "g")
+            # 同一模板两者都给时，按名称的映射优先于默认区域。
+            self.assertEqual(self.client.find_any_image({"g": green.getvalue()}, confidence=1, region_relative=(0, 0, .5, .7), regions_relative={"g": (.5, .5, 1, 1)})[0], "g")
+            # find_images 与 wait_any_image 同样接受单数默认区域。
+            self.assertIsNone(self.client.find_images({"g": green.getvalue()}, confidence=1, region_relative=(0, 0, .5, .7))["g"])
+            self.assertEqual(self.client.find_images({"g": green.getvalue()}, confidence=1, region_relative=(.5, .5, 1, 1))["g"].center, (12.0, 8.0))
+            with self.assertRaises(TimeoutError):
+                self.client.wait_any_image({"g": green.getvalue()}, confidence=1, timeout=0, initial_delay=False, region_relative=(0, 0, .5, .7))
+            name, match = self.client.wait_any_image({"g": green.getvalue()}, confidence=1, timeout=0, initial_delay=False, region_relative=(.5, .5, 1, 1))
+            self.assertEqual((name, match.center), ("g", (12.0, 8.0)))
+        finally:
+            self.client.screenshot = original
+
     def test_wait_any_uses_one_full_snapshot_per_attempt_and_regex_stays_local(self):
         original = self.client.ui_tree; calls = []
         self.client.ui_tree = lambda **kwargs: calls.append(kwargs) or {"views": [{"name": "root", "childs": [{"name": "success_42", "label": "完成", "childs": []}]}]}

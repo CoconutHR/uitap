@@ -90,7 +90,7 @@ device(text="登录").click()              # 确认无误后再点击
 | 查电池 / 设备信息 | `client.battery_info()` / `client.device_info()` |
 | 查到唯一元素才点击（锁内原子） | `device.click_if_unique(device.selector().name("提交"))` |
 | 一帧中找多个模板 | `client.find_images({"成功": "success.png", "失败": "failure.png"})` |
-| 等待任意页面结果 | `name, match = client.wait_any_image({...}, timeout=20)` |
+| 等待任意页面结果（可各给区域） | `name, match = client.wait_any_image({...}, regions={...}, timeout=20)` |
 | 本地快照关系查询 | `device.snapshot()(name="表单").child(device.selector().text("提交"))` |
 | 读取控件树 XML 字符串 | `device.dump_hierarchy()` |
 | 每步自动留证据的可靠执行 | `run.step("登录", login.click, capture_after=True)` |

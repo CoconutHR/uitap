@@ -6,13 +6,27 @@ import binascii
 import math
 import time
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from ..core.models import ImageMatch
 from ..errors import DeviceConnectionError, DeviceOperationError, DeviceResponseError, UitapError
 from ..i18n import t
 from ..vision import ScreenFrame
 from .coordinates import swipe_gesture
+
+
+def _resolved_region(name: str, *, regions: Mapping[str, Any] | None, regions_relative: Mapping[str, Any] | None, regions_pixels: Mapping[str, Any] | None, region: Any, region_relative: Any, region_pixels: Any) -> tuple[Any, Any, Any]:
+    """Pick a template's search region: per-name mapping first, call-wide default second.
+
+    A template that has an entry in any of the ``regions*`` mappings uses only the
+    mapped trio (so a per-name entry never mixes with the default and trips the
+    "regions cannot be combined" validation); everything else falls back to the
+    call-wide ``region*`` defaults.
+    """
+    overridden = any(mapping is not None and name in mapping for mapping in (regions, regions_relative, regions_pixels))
+    if overridden:
+        return (regions or {}).get(name), (regions_relative or {}).get(name), (regions_pixels or {}).get(name)
+    return region, region_relative, region_pixels
 
 
 class ImagesMixin:
@@ -134,19 +148,30 @@ class ImagesMixin:
         frame, action = self._capture_vision_frame(exact=confidence == 1)
         return self._find_image_in_vision_frame(frame, action, template, confidence=confidence, region=region, region_relative=region_relative, region_pixels=region_pixels)
 
-    def find_images(self, templates: Mapping[str, str | Path | bytes], *, confidence: float = 0.9, regions: Mapping[str, tuple[int, int, int, int] | tuple[float, float, float, float] | None] | None = None, regions_relative: Mapping[str, tuple[float, float, float, float] | None] | None = None, regions_pixels: Mapping[str, tuple[int, int, int, int] | None] | None = None) -> dict[str, ImageMatch | None]:
-        """在一张截图中匹配多个模板。"""
-        frame, action = self._capture_vision_frame(exact=confidence == 1)
-        return {
-            name: self._find_image_in_vision_frame(frame, action, template, confidence=confidence, region=(regions or {}).get(name), region_relative=(regions_relative or {}).get(name), region_pixels=(regions_pixels or {}).get(name))
-            for name, template in templates.items()
-        }
+    def find_images(self, templates: Mapping[str, str | Path | bytes], *, confidence: float = 0.9, regions: Mapping[str, tuple[int, int, int, int] | tuple[float, float, float, float] | None] | None = None, regions_relative: Mapping[str, tuple[float, float, float, float] | None] | None = None, regions_pixels: Mapping[str, tuple[int, int, int, int] | None] | None = None, region: tuple[int, int, int, int] | tuple[float, float, float, float] | None = None, region_relative: tuple[float, float, float, float] | None = None, region_pixels: tuple[int, int, int, int] | None = None) -> dict[str, ImageMatch | None]:
+        """在一张截图中匹配多个模板。
 
-    def find_any_image(self, templates: Mapping[str, str | Path | bytes], *, confidence: float = 0.9, regions: Mapping[str, tuple[int, int, int, int] | tuple[float, float, float, float] | None] | None = None, regions_relative: Mapping[str, tuple[float, float, float, float] | None] | None = None, regions_pixels: Mapping[str, tuple[int, int, int, int] | None] | None = None) -> tuple[str, ImageMatch] | None:
-        """在一张截图中寻找任意模板，返回第一个命中的名称和结果。"""
+        ``regions`` / ``regions_relative`` / ``regions_pixels`` 按模板名称给出每张
+        模板各自的搜索区域；``region`` / ``region_relative`` / ``region_pixels``
+        是作用于全部模板的默认区域。同一模板两者都给时，按名称的映射优先。
+        """
+        frame, action = self._capture_vision_frame(exact=confidence == 1)
+        matches: dict[str, ImageMatch | None] = {}
+        for name, template in templates.items():
+            specific, specific_relative, specific_pixels = _resolved_region(name, regions=regions, regions_relative=regions_relative, regions_pixels=regions_pixels, region=region, region_relative=region_relative, region_pixels=region_pixels)
+            matches[name] = self._find_image_in_vision_frame(frame, action, template, confidence=confidence, region=specific, region_relative=specific_relative, region_pixels=specific_pixels)
+        return matches
+
+    def find_any_image(self, templates: Mapping[str, str | Path | bytes], *, confidence: float = 0.9, regions: Mapping[str, tuple[int, int, int, int] | tuple[float, float, float, float] | None] | None = None, regions_relative: Mapping[str, tuple[float, float, float, float] | None] | None = None, regions_pixels: Mapping[str, tuple[int, int, int, int] | None] | None = None, region: tuple[int, int, int, int] | tuple[float, float, float, float] | None = None, region_relative: tuple[float, float, float, float] | None = None, region_pixels: tuple[int, int, int, int] | None = None) -> tuple[str, ImageMatch] | None:
+        """在一张截图中寻找任意模板，返回第一个命中的名称和结果。
+
+        区域参数与 :meth:`find_images` 相同：``regions*`` 按模板名称给出各自区域，
+        ``region*`` 是全部模板共用的默认区域，按名称的映射优先。
+        """
         frame, action = self._capture_vision_frame(exact=confidence == 1)
         for name, template in templates.items():
-            match = self._find_image_in_vision_frame(frame, action, template, confidence=confidence, region=(regions or {}).get(name), region_relative=(regions_relative or {}).get(name), region_pixels=(regions_pixels or {}).get(name))
+            specific, specific_relative, specific_pixels = _resolved_region(name, regions=regions, regions_relative=regions_relative, regions_pixels=regions_pixels, region=region, region_relative=region_relative, region_pixels=region_pixels)
+            match = self._find_image_in_vision_frame(frame, action, template, confidence=confidence, region=specific, region_relative=specific_relative, region_pixels=specific_pixels)
             if match is not None:
                 return name, match
         return None
@@ -167,14 +192,20 @@ class ImagesMixin:
             if time.monotonic() >= deadline: raise TimeoutError("image did not appear before timeout")
             time.sleep(min(interval, deadline - time.monotonic()))
 
-    def wait_any_image(self, templates: Mapping[str, str | Path | bytes], *, confidence: float = 0.9, timeout: float = 10.0, interval: float = 0.5, regions: Mapping[str, tuple[int, int, int, int] | tuple[float, float, float, float] | None] | None = None, regions_relative: Mapping[str, tuple[float, float, float, float] | None] | None = None, regions_pixels: Mapping[str, tuple[int, int, int, int] | None] | None = None, initial_delay: bool = True) -> tuple[str, ImageMatch]:
-        """等待任意模板出现；每轮只抓取并解码一张截图。"""
+    def wait_any_image(self, templates: Mapping[str, str | Path | bytes], *, confidence: float = 0.9, timeout: float = 10.0, interval: float = 0.5, regions: Mapping[str, tuple[int, int, int, int] | tuple[float, float, float, float] | None] | None = None, regions_relative: Mapping[str, tuple[float, float, float, float] | None] | None = None, regions_pixels: Mapping[str, tuple[int, int, int, int] | None] | None = None, region: tuple[int, int, int, int] | tuple[float, float, float, float] | None = None, region_relative: tuple[float, float, float, float] | None = None, region_pixels: tuple[int, int, int, int] | None = None, initial_delay: bool = True) -> tuple[str, ImageMatch]:
+        """等待任意模板出现；每轮只抓取并解码一张截图。
+
+        区域参数与 :meth:`find_any_image` 相同：``regions`` / ``regions_relative`` /
+        ``regions_pixels`` 按模板名称给出每张模板各自的搜索区域（形如
+        ``regions={"成功": (0, 0, 1179, 900)}``）；``region`` / ``region_relative`` /
+        ``region_pixels`` 是全部模板共用的默认区域；同一模板两者都给时按名称的映射优先。
+        """
         if not templates: raise ValueError("templates must not be empty")
         if timeout < 0 or interval <= 0: raise ValueError("timeout must be non-negative and interval must be positive")
         deadline = time.monotonic() + timeout
         if initial_delay: time.sleep(min(interval, timeout))
         while True:
-            result = self.find_any_image(templates, confidence=confidence, regions=regions, regions_relative=regions_relative, regions_pixels=regions_pixels)
+            result = self.find_any_image(templates, confidence=confidence, regions=regions, regions_relative=regions_relative, regions_pixels=regions_pixels, region=region, region_relative=region_relative, region_pixels=region_pixels)
             if result is not None: return result
             if time.monotonic() >= deadline: raise TimeoutError(f"none of the images appeared before timeout: {', '.join(templates)}")
             time.sleep(min(interval, deadline - time.monotonic()))

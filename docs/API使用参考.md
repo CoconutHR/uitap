@@ -461,7 +461,7 @@ HID JPEG 是有损图像，因此 `confidence=1.0` 的精确匹配仍固定使�
 
 真机 USB 验证（iPhone / iOS 26.6.1 / AScript 4001）中，HID JPEG 的获取与 Pillow 解码中位约 `81ms`，完整 PNG 截图回传中位约 `406ms`；在实际删除任务轮询脚本的稳定热态下，单次模板查询约 `73–126ms`，原 PNG 路径约 `200–250ms`。这些是特定设备、模板和 USB 环境的观测值，而不是跨设备性能承诺。生产脚本应使用同一分辨率、方向和 UI 缩放条件截取模板，为 JPEG 匹配选择经实机验证的阈值，并用 `region` / `region_relative` 限制搜索范围。
 
-单模板和所有图像等待/点击/滚动 API 都可用物理像素 `region=(left, top, right, bottom)` 或比例 `region_relative=(left, top, right, bottom)` 限制搜索区域，两者不能同时传入。多模板接口的 `regions`、`regions_relative` 为按模板名称映射的同类区域；每张模板可有自己的小区域。旧 `region_pixels` / `regions_pixels` 是物理像素弃用别名，会发出 `DeprecationWarning`。旧版比例 `region` 仅在包含非整数时暂时兼容并发出警告；尤其旧全屏写法 `region=(0, 0, 1, 1)` 必须改为 `region_relative=(0, 0, 1, 1)`，因为新规则下它表示 1×1 物理像素区域。
+单模板和所有图像等待/点击/滚动 API 都可用物理像素 `region=(left, top, right, bottom)` 或比例 `region_relative=(left, top, right, bottom)` 限制搜索区域，两者不能同时传入。多模板接口（`find_images()`、`find_any_image()`、`wait_any_image()`）额外支持按模板名称映射的 `regions` / `regions_relative` / `regions_pixels`，让每张模板拥有各自的搜索区域；同时也可以直接传单数 `region` / `region_relative` / `region_pixels`，作为全部模板共用的默认区域。同一模板同时给出两者时，按名称的映射优先于默认区域。旧 `region_pixels` / `regions_pixels` 是物理像素弃用别名，会发出 `DeprecationWarning`。旧版比例 `region` 仅在包含非整数时暂时兼容并发出警告；尤其旧全屏写法 `region=(0, 0, 1, 1)` 必须改为 `region_relative=(0, 0, 1, 1)`，因为新规则下它表示 1×1 物理像素区域。
 
 ```python
 match = client.find_image("assets/login-icon.png", confidence=0.95)
@@ -478,9 +478,11 @@ matches = client.find_images(
     regions_relative={"success": (0, 0.2, 1, 0.8), "retry": (0, 0.7, 1, 1)},
 )
 
-# 等待成功页或错误页任一出现；返回 (名称, ImageMatch)。
+# 等待成功页或错误页任一出现；两页位置不同，各给各的搜索区域（也可传单数
+# region/region_relative 作为全部模板共用的默认区域）。
 name, match = client.wait_any_image(
     {"success": "assets/success.png", "failure": "assets/failure.png"},
+    regions={"success": (0, 0, 1179, 900), "failure": (0, 900, 1179, 2556)},
     timeout=20,
 )
 
