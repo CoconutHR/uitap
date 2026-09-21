@@ -80,7 +80,7 @@ class ScreenFrame:
         return output.getvalue()
 
     def crop_relative(self, left: float, top: float, right: float, bottom: float) -> bytes:
-        x0, y0, x1, y1 = self._region(None, (left, top, right, bottom))
+        x0, y0, x1, y1 = self.resolve_region(region_relative=(left, top, right, bottom))
         x1, y1 = max(x1, x0 + 1), max(y1, y0 + 1)
         return self.crop_pixels(x0, y0, min(self.width, x1), min(self.height, y1))
 
@@ -91,14 +91,14 @@ class ScreenFrame:
         return self.pixel_relative(x_ratio, y_ratio).matches(expected, tolerance=tolerance, include_alpha=include_alpha)
 
     def find_color(self, expected: PixelColor | tuple[int, int, int] | tuple[int, int, int, int] | str, *, tolerance: int = 0, region: tuple[int, int, int, int] | None = None, region_relative: tuple[float, float, float, float] | None = None, include_alpha: bool = False) -> tuple[int, int] | None:
-        x0, y0, x1, y1 = self._region(region, region_relative)
+        x0, y0, x1, y1 = self.resolve_region(region=region, region_relative=region_relative)
         for y in range(y0, y1):
             for x in range(x0, x1):
                 if self.color_matches(x, y, expected, tolerance=tolerance, include_alpha=include_alpha): return x, y
         return None
 
     def count_color(self, expected: PixelColor | tuple[int, int, int] | tuple[int, int, int, int] | str, *, tolerance: int = 0, region: tuple[int, int, int, int] | None = None, region_relative: tuple[float, float, float, float] | None = None, include_alpha: bool = False) -> int:
-        x0, y0, x1, y1 = self._region(region, region_relative)
+        x0, y0, x1, y1 = self.resolve_region(region=region, region_relative=region_relative)
         return sum(self.color_matches(x, y, expected, tolerance=tolerance, include_alpha=include_alpha) for y in range(y0, y1) for x in range(x0, x1))
 
     def assert_color(self, x: int, y: int, expected: PixelColor | tuple[int, int, int] | tuple[int, int, int, int] | str, *, tolerance: int = 0, include_alpha: bool = False) -> PixelColor:
@@ -106,7 +106,14 @@ class ScreenFrame:
         if not actual.matches(expected, tolerance=tolerance, include_alpha=include_alpha): raise AssertionError(f"color at ({x}, {y}) is {actual.hex}, expected {PixelColor.parse(expected).hex}")
         return actual
 
-    def _region(self, region: tuple[int, int, int, int] | None, region_relative: tuple[float, float, float, float] | None) -> tuple[int, int, int, int]:
+    def resolve_region(self, *, region: tuple[int, int, int, int] | None = None, region_relative: tuple[float, float, float, float] | None = None) -> tuple[int, int, int, int]:
+        """把搜索区域解析为物理像素矩形 ``(left, top, right, bottom)``。
+
+        ``region`` 为物理像素整数，``region_relative`` 为 ``0..1`` 比例，两者
+        不能同时传入。参数只接受关键字，避免跨模块调用时因参数顺序或个数
+        变化而静默错位（0.1.1 的裁剪/OCR 回归正是私有方法被跨模块按位置调用
+        且签名收窄造成的）。
+        """
         if region is not None and region_relative is not None: raise ValueError("region and region_relative cannot be combined")
         if region_relative is not None:
             try: left, top, right, bottom = (float(value) for value in region_relative)
@@ -181,7 +188,7 @@ class ScreenFrame:
         if not math.isfinite(confidence) or not 0 < confidence <= 1: raise ValueError("confidence must be a finite number in (0, 1]")
         needle = self._template(template)
         if self._rgb is None: self._rgb = self._image.convert("RGB")
-        haystack = self._rgb; template_width, template_height = needle.image.size; x0, y0, x1, y1 = self._region(region, region_relative)
+        haystack = self._rgb; template_width, template_height = needle.image.size; x0, y0, x1, y1 = self.resolve_region(region=region, region_relative=region_relative)
         if template_width > x1 - x0 or template_height > y1 - y0: return None
         if confidence == 1:
             return self._find_exact(needle, (x0, y0, x1, y1))

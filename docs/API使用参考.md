@@ -437,6 +437,8 @@ client.save_screenshot_crop("artifacts/bottom.png", 0, 1800, 1179, 2556)
 
 `capture_frame()` 抓取一张物理像素截图，返回 `ScreenFrame`。同一帧可完成多个取色或找图操作，不会重复抓屏。`PixelColor` 为强类型 RGBA 颜色，默认以 `.rgb` 返回三元组，也可用 `.hex` 获取大写十六进制字符串。
 
+`ScreenFrame.resolve_region(region=..., region_relative=...)` 是区域解析的公开入口：把物理像素矩形或 `0..1` 比例矩形统一解析为 `(left, top, right, bottom)`，两个参数只接受关键字且不能同时传入。需要按区域自行取色、裁剪或调用设备端图色/OCR 时可用它复用同一套边界校验；它只接受关键字参数，因此按位置误传会立即报错而不是静默错位。
+
 ```python
 frame = client.capture_frame()
 color = frame.pixel(100, 200)             # 绝对物理像素
