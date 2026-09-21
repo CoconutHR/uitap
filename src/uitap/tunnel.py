@@ -5,7 +5,6 @@ import socket
 import subprocess
 import sys
 import time
-import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -185,14 +184,8 @@ class Tunnel:
         ``uitap.json`` 的 ``tunnel`` 键一致（``iproxy``、``udid``、
         端口等）。``path`` 指定配置文件，默认读取当前目录的
         ``uitap.json``；文件不存在时退回内置默认值，不确定配置
-        是否被读取时可用 ``py -m uitap doctor`` 检查。过时别名
-        ``executable`` 等效 ``iproxy``，使用时会发出
-        ``DeprecationWarning``，将在后续版本移除。
+        是否被读取时可用 ``python -m uitap doctor`` 检查。
         """
-        if "executable" in overrides:
-            if "iproxy" in overrides: raise ValueError(t("tunnel_config_conflict"))
-            warnings.warn(t("tunnel_executable_deprecated"), DeprecationWarning, stacklevel=2)
-            overrides["iproxy"] = overrides.pop("executable")
         unknown = sorted(set(overrides) - set(cls._CONFIG_FIELDS))
         if unknown: raise ValueError(t("tunnel_config_unknown", keys=", ".join(unknown)))
         config = tunnel_options(load_config(path))

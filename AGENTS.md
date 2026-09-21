@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本文件供各类编码代理（Claude Code、Codex、Cursor 等）在本仓库工作时参考；`CLAUDE.md` 通过一行 `@AGENTS.md` 导入本文件，内容只在此处维护。
+本文件供各类编码代理（Claude Code、Codex、Cursor、DSH 等）在本仓库工作时参考；`CLAUDE.md` 通过一行 `@AGENTS.md` 导入本文件，内容只在此处维护。
 
 ## 项目概况
 
@@ -9,10 +9,12 @@ uitap 是一个 **uiautomator2 式 iOS 设备自动化客户端**（PyPI 包名 
 ## 常用命令
 
 ```bat
-py -m pip install -e ".[vision]"     # 本地开发安装
-py -m unittest discover -s tests -v  # 全部单元测试；真机集成测试默认禁用
-py -m pyflakes src/uitap             # 静态检查（未定义名/未用导入）
-ut help                              # CLI 速查（py -m uitap 完全等价）
+python -m pip install -e ".[dev,vision]"  # 本地开发安装（含 pyflakes / build 与视觉依赖）
+python -m unittest discover -s tests -v   # 全部单元测试；真机集成测试默认禁用
+python -m pyflakes src/uitap              # 静态检查（未定义名/未用导入）
+python scripts/version_sync.py            # 发布元数据三处版本一致性（测试也会强制）
+python scripts/smoke.py                   # 真机只读冒烟（需 tests/integration.json 且 enabled: true）
+ut help                                   # CLI 速查（python -m uitap 完全等价）
 ```
 
 真机验收需要 `tests/integration.json`（`enabled: true`）与已开启设备服务的 iPhone。
@@ -39,9 +41,10 @@ Cookie `airscript=<password>`、`eval_python` 中执行的设备端模块 `ascri
 
 ## 发布流程
 
-1. 更新 `pyproject.toml` 版本、`docs/变更说明.md`，并同步 API 文档首行版本
-2. `git tag -a vX.Y.Z -m "uitap X.Y.Z" && git push origin vX.Y.Z`
-3. `release.yml` 自动执行：8 矩阵验证 → 构建并创建 GitHub Release → Trusted Publishing 发布到 PyPI（无需 token）
+1. 更新 `pyproject.toml` 版本、`docs/变更说明.md`，并同步 `docs/API使用参考.md` 首行版本；三处必须一致，`python scripts/version_sync.py` 与 `tests/test_release_metadata.py` 会强制校验
+2. `python -m unittest discover -s tests -v` 全绿后提交、推送 `main`
+3. `git tag -a vX.Y.Z -m "uitap X.Y.Z" && git push origin vX.Y.Z`（tag 必须与包版本一致）
+4. `release.yml` 自动执行：8 矩阵验证（含 tag 与三处版本校验）→ 构建并创建 GitHub Release → Trusted Publishing 发布到 PyPI（无需 token）
 
 ## 本机上下文（仅本机开发时参考）
 

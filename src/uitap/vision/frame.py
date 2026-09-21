@@ -1,9 +1,9 @@
 """ScreenFrame：截图帧的像素/颜色/裁剪/模板匹配。"""
 from __future__ import annotations
 
+import importlib
 import math
 import threading
-import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
 from io import BytesIO
@@ -36,8 +36,9 @@ def _opencv_available() -> bool:
     global _OPENCV_AVAILABLE
     if _OPENCV_AVAILABLE is None:
         try:
-            import cv2  # noqa: F401
-            import numpy  # noqa: F401
+            # 用 import_module 探测：既真正尝试导入，又不产生 pyflakes 的未使用导入告警。
+            importlib.import_module("cv2")
+            importlib.import_module("numpy")
             _OPENCV_AVAILABLE = True
         except ImportError:
             _OPENCV_AVAILABLE = False
@@ -90,14 +91,14 @@ class ScreenFrame:
         return self.pixel_relative(x_ratio, y_ratio).matches(expected, tolerance=tolerance, include_alpha=include_alpha)
 
     def find_color(self, expected: PixelColor | tuple[int, int, int] | tuple[int, int, int, int] | str, *, tolerance: int = 0, region: tuple[int, int, int, int] | None = None, region_relative: tuple[float, float, float, float] | None = None, include_alpha: bool = False) -> tuple[int, int] | None:
-        x0, y0, x1, y1 = self._region(region, region_relative, None)
+        x0, y0, x1, y1 = self._region(region, region_relative)
         for y in range(y0, y1):
             for x in range(x0, x1):
                 if self.color_matches(x, y, expected, tolerance=tolerance, include_alpha=include_alpha): return x, y
         return None
 
     def count_color(self, expected: PixelColor | tuple[int, int, int] | tuple[int, int, int, int] | str, *, tolerance: int = 0, region: tuple[int, int, int, int] | None = None, region_relative: tuple[float, float, float, float] | None = None, include_alpha: bool = False) -> int:
-        x0, y0, x1, y1 = self._region(region, region_relative, None)
+        x0, y0, x1, y1 = self._region(region, region_relative)
         return sum(self.color_matches(x, y, expected, tolerance=tolerance, include_alpha=include_alpha) for y in range(y0, y1) for x in range(x0, x1))
 
     def assert_color(self, x: int, y: int, expected: PixelColor | tuple[int, int, int] | tuple[int, int, int, int] | str, *, tolerance: int = 0, include_alpha: bool = False) -> PixelColor:
@@ -105,12 +106,8 @@ class ScreenFrame:
         if not actual.matches(expected, tolerance=tolerance, include_alpha=include_alpha): raise AssertionError(f"color at ({x}, {y}) is {actual.hex}, expected {PixelColor.parse(expected).hex}")
         return actual
 
-    def _region(self, region: tuple[int, int, int, int] | tuple[float, float, float, float] | None, region_relative: tuple[float, float, float, float] | None, region_pixels: tuple[int, int, int, int] | None) -> tuple[int, int, int, int]:
-        supplied = sum(value is not None for value in (region, region_relative, region_pixels))
-        if supplied > 1: raise ValueError("region, region_relative, and region_pixels cannot be combined")
-        if region_pixels is not None:
-            warnings.warn("region_pixels is deprecated; use region for physical pixels", DeprecationWarning, stacklevel=3)
-            region = region_pixels
+    def _region(self, region: tuple[int, int, int, int] | None, region_relative: tuple[float, float, float, float] | None) -> tuple[int, int, int, int]:
+        if region is not None and region_relative is not None: raise ValueError("region and region_relative cannot be combined")
         if region_relative is not None:
             try: left, top, right, bottom = (float(value) for value in region_relative)
             except (TypeError, ValueError) as exc: raise ValueError("region_relative must contain four ratios") from exc
@@ -120,8 +117,7 @@ class ScreenFrame:
         if region is None: return 0, 0, self.width, self.height
         if len(region) != 4: raise ValueError("region must contain four physical pixel coordinates")
         if not all(isinstance(value, int) for value in region):
-            warnings.warn("relative region is deprecated; use region_relative", DeprecationWarning, stacklevel=3)
-            return self._region(None, tuple(float(value) for value in region), None)
+            raise ValueError("region must be four physical pixel integers; pass ratios as region_relative=(left, top, right, bottom)")
         left, top, right, bottom = region
         if not (0 <= left < right <= self.width and 0 <= top < bottom <= self.height):
             raise ValueError("region must satisfy screen bounds and left < right, top < bottom")
@@ -181,11 +177,11 @@ class ScreenFrame:
                 offset = source.find(first_row, offset + 1, row_end + row_size)
         return None
 
-    def find_image(self, template: str | Path | bytes, *, confidence: float = 0.9, region: tuple[int, int, int, int] | tuple[float, float, float, float] | None = None, region_relative: tuple[float, float, float, float] | None = None, region_pixels: tuple[int, int, int, int] | None = None) -> "ImageMatch | None":
+    def find_image(self, template: str | Path | bytes, *, confidence: float = 0.9, region: tuple[int, int, int, int] | None = None, region_relative: tuple[float, float, float, float] | None = None) -> "ImageMatch | None":
         if not math.isfinite(confidence) or not 0 < confidence <= 1: raise ValueError("confidence must be a finite number in (0, 1]")
         needle = self._template(template)
         if self._rgb is None: self._rgb = self._image.convert("RGB")
-        haystack = self._rgb; template_width, template_height = needle.image.size; x0, y0, x1, y1 = self._region(region, region_relative, region_pixels)
+        haystack = self._rgb; template_width, template_height = needle.image.size; x0, y0, x1, y1 = self._region(region, region_relative)
         if template_width > x1 - x0 or template_height > y1 - y0: return None
         if confidence == 1:
             return self._find_exact(needle, (x0, y0, x1, y1))
@@ -248,5 +244,5 @@ class ScreenFrame:
                 if error <= allowed and (best is None or score > best.confidence): best = ImageMatch(x, y, template_width, template_height, score)
         return best
 
-    def find_images(self, templates: dict[str, str | Path | bytes], *, confidence: float = 0.9, regions: dict[str, tuple[int, int, int, int] | tuple[float, float, float, float] | None] | None = None, regions_relative: dict[str, tuple[float, float, float, float] | None] | None = None, regions_pixels: dict[str, tuple[int, int, int, int] | None] | None = None) -> dict[str, "ImageMatch | None"]:
-        return {name: self.find_image(template, confidence=confidence, region=(regions or {}).get(name), region_relative=(regions_relative or {}).get(name), region_pixels=(regions_pixels or {}).get(name)) for name, template in templates.items()}
+    def find_images(self, templates: dict[str, str | Path | bytes], *, confidence: float = 0.9, regions: dict[str, tuple[int, int, int, int] | None] | None = None, regions_relative: dict[str, tuple[float, float, float, float] | None] | None = None) -> dict[str, "ImageMatch | None"]:
+        return {name: self.find_image(template, confidence=confidence, region=(regions or {}).get(name), region_relative=(regions_relative or {}).get(name)) for name, template in templates.items()}

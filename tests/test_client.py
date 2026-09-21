@@ -114,10 +114,10 @@ class ClientTests(unittest.TestCase):
         source.paste(template, (12, 8))
         source_data, template_data = BytesIO(), BytesIO()
         source.save(source_data, "PNG"); template.save(template_data, "PNG")
-        match = self.client._image_match(source_data.getvalue(), template_data.getvalue(), confidence=0.99, region=(0.4, 0.3, 0.9, 0.8))
+        match = self.client._image_match(source_data.getvalue(), template_data.getvalue(), confidence=0.99, region_relative=(0.4, 0.3, 0.9, 0.8))
         self.assertIsNotNone(match)
         self.assertEqual((match.x, match.y, match.width, match.height), (12, 8, 4, 3))
-        self.assertIsNone(self.client._image_match(source_data.getvalue(), template_data.getvalue(), confidence=0.99, region=(0, 0, 0.4, 0.3)))
+        self.assertIsNone(self.client._image_match(source_data.getvalue(), template_data.getvalue(), confidence=0.99, region_relative=(0, 0, 0.4, 0.3)))
 
     def test_hid_vision_frame_maps_coordinates_without_changing_png_screenshot_contract(self):
         from io import BytesIO
@@ -711,15 +711,13 @@ class ClientTests(unittest.TestCase):
             # 配置文件不存在时退回内置默认值。
             self.assertEqual(Tunnel.from_config(Path(directory) / "missing.json").address, "127.0.0.1:9096")
 
-    def test_tunnel_from_config_supports_and_rejects_parameter_aliases(self):
+    def test_tunnel_from_config_rejects_retired_and_unknown_parameters(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "uitap.json"
             path.write_text('{"tunnel": {"iproxy": "custom-iproxy", "local_port": 19096, "udid": "abc"}}', encoding="utf-8")
-            # 过时别名 executable 仍可用，但发出弃用警告。
-            with self.assertWarns(DeprecationWarning):
-                aliased = Tunnel.from_config(path, executable="alias-iproxy")
-            self.assertEqual(aliased.service.command, ["alias-iproxy", "-u", "abc", "19096", "9096"])
-            with self.assertRaises(ValueError): Tunnel.from_config(path, executable="a", iproxy="b")
+            # 正式参数名是 iproxy；已移除的过时别名 executable 不再接受。
+            self.assertEqual(Tunnel.from_config(path, iproxy="alias-iproxy").service.command, ["alias-iproxy", "-u", "abc", "19096", "9096"])
+            with self.assertRaises(ValueError): Tunnel.from_config(path, executable="a")
             with self.assertRaises(ValueError): Tunnel.from_config(path, unknown=1)
 
     def test_missing_iproxy_message_is_actionable_on_windows(self):
@@ -1208,12 +1206,13 @@ class ClientTests(unittest.TestCase):
         screen.paste(template, (4, 4)); source, needle = BytesIO(), BytesIO(); screen.save(source, "PNG"); template.save(needle, "PNG")
         original = self.client.screenshot; self.client.screenshot = lambda: source.getvalue()
         try:
-            self.assertEqual(self.client.wait_image(needle.getvalue(), confidence=1, timeout=0, initial_delay=False, region_pixels=(4, 4, 8, 8)).center, (5.0, 5.0))
-            with self.assertRaises(ValueError): self.client.wait_image(needle.getvalue(), timeout=0, initial_delay=False, region=(0, 0, 1, 1), region_pixels=(0, 0, 8, 8))
+            self.assertEqual(self.client.wait_image(needle.getvalue(), confidence=1, timeout=0, initial_delay=False, region=(4, 4, 8, 8)).center, (5.0, 5.0))
+            with self.assertRaises(ValueError): self.client.wait_image(needle.getvalue(), timeout=0, initial_delay=False, region=(0, 0, 8, 8), region_relative=(0, 0, 1, 1))
+            with self.assertRaises(TypeError): self.client.wait_image(needle.getvalue(), timeout=0, initial_delay=False, region_pixels=(0, 0, 8, 8))
         finally:
             self.client.screenshot = original
 
-    def test_image_region_uses_pixels_and_legacy_relative_inputs_warn(self):
+    def test_image_region_uses_pixels_and_rejects_retired_aliases(self):
         from io import BytesIO
         from PIL import Image
         source = Image.new("RGB", (10, 10), "black"); template = Image.new("RGB", (2, 2), "red"); source.paste(template, (6, 6))
@@ -1222,13 +1221,14 @@ class ClientTests(unittest.TestCase):
         frame = ScreenFrame(source_data.getvalue())
         self.assertEqual((frame.find_image(template_data.getvalue(), confidence=1, region=(5, 5, 10, 10)).x, frame.find_image(template_data.getvalue(), confidence=1, region=(5, 5, 10, 10)).y), (6, 6))
         self.assertEqual((frame.find_image(template_data.getvalue(), confidence=1, region_relative=(.5, .5, 1, 1)).x, frame.find_image(template_data.getvalue(), confidence=1, region_relative=(.5, .5, 1, 1)).y), (6, 6))
-        with self.assertWarns(DeprecationWarning):
-            self.assertIsNotNone(frame.find_image(template_data.getvalue(), confidence=1, region=(.5, .5, 1., 1.)))
-        with self.assertWarns(DeprecationWarning):
-            self.assertIsNotNone(frame.find_image(template_data.getvalue(), confidence=1, region_pixels=(5, 5, 10, 10)))
+        # 全整数四元组始终是物理像素区域：1×1 合法但匹配不到模板。
         self.assertIsNone(frame.find_image(template_data.getvalue(), confidence=1, region=(0, 0, 1, 1)))
         with self.assertRaises(ValueError):
+            frame.find_image(template_data.getvalue(), confidence=1, region=(.5, .5, 1., 1.))
+        with self.assertRaises(ValueError):
             frame.find_image(template_data.getvalue(), confidence=1, region=(5, 5, 10, 10), region_relative=(.5, .5, 1, 1))
+        with self.assertRaises(TypeError):
+            frame.find_image(template_data.getvalue(), confidence=1, region_pixels=(5, 5, 10, 10))
 
     def test_duration_seconds_and_milliseconds_normalize_without_conflicts(self):
         self.assertEqual(self.client._duration_ms(.65, None, default_ms=20), 650)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "uitap"
-version = "0.1.0"
+version = "0.1.1"
 description = "uiautomator2-style iOS UI automation client"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +27,7 @@ dependencies = []
 
 [project.optional-dependencies]
 vision = ["Pillow>=9.0", "opencv-python-headless>=4.5"]
+dev = ["pyflakes>=3.2", "build>=1.2"]
 
 [project.urls]
 Homepage = "https://github.com/CoconutHR/uitap"

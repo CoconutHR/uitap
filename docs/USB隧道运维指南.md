@@ -102,21 +102,21 @@ USB 使用时将 `device.address` 设为本机回环地址：
 
 ## CLI 使用
 
-本节命令沿用 `py -m uitap` 的 Windows 写法；macOS/Linux 替换为 `python3 -m uitap`，`Scripts` 目录已加入 `PATH` 时可直接用 `ut`。三种形式的完整说明见 [API 使用参考](API使用参考.md)的“CLI 参考 → 调用方式”。
+本节命令沿用 `python -m uitap` 的 Windows 写法；macOS/Linux 替换为 `python3 -m uitap`，`Scripts` 目录已加入 `PATH` 时可直接用 `ut`。三种形式的完整说明见 [API 使用参考](API使用参考.md)的“CLI 参考 → 调用方式”。
 
 在一个专用终端中保持隧道运行：
 
 ```bat
-py -m uitap tunnel
+python -m uitap tunnel
 ```
 
 启动前或出现故障时，先运行只读诊断：
 
 ```bat
-py -m uitap doctor --report artifacts\usb-doctor.json
+python -m uitap doctor --report artifacts\usb-doctor.json
 ```
 
-它会分别报告 `iproxy`、本机 `9096/10102`、设备控制服务和日志端口。端口被占用时不会自动终止其他进程；缺少 `iproxy` 时不会自动下载安装。若已手工安装但未加入 `PATH`，可在审查路径后执行 `py -m uitap doctor --fix-iproxy "D:\\tools\\libimobiledevice\\iproxy.exe"`，再确认写入配置。
+它会分别报告 `iproxy`、本机 `9096/10102`、设备控制服务和日志端口。端口被占用时不会自动终止其他进程；缺少 `iproxy` 时不会自动下载安装。若已手工安装但未加入 `PATH`，可在审查路径后执行 `python -m uitap doctor --fix-iproxy "D:\\tools\\libimobiledevice\\iproxy.exe"`，再确认写入配置。
 
 成功后会显示（路由中 `service` 为控制端口映射，`logs` 为日志端口映射）：
 
@@ -127,9 +127,9 @@ USB 隧道已启动：service=127.0.0.1:9096 -> device:9096; logs=127.0.0.1:1010
 在另一个终端中使用正常命令：
 
 ```bat
-py -m uitap status
-py -m uitap shot artifacts\usb-screen.png
-py -m uitap inspect
+python -m uitap status
+python -m uitap shot artifacts\usb-screen.png
+python -m uitap inspect
 ```
 
 USB 场景下 `inspect` 的两个地址都是回环地址，但含义不同：设备地址 `127.0.0.1:9096` 经 `iproxy` 转发到手机，Inspector 自身监听的 `127.0.0.1:<随机端口>` 是给本机浏览器访问的网页服务。前者由 `--device` 或配置文件指定，后者由 `inspect --host` / `--port` 指定，两者不要互相填错。
@@ -137,8 +137,8 @@ USB 场景下 `inspect` 的两个地址都是回环地址，但含义不同：�
 临时覆盖配置：
 
 ```bat
-py -m uitap tunnel --local-port 19096 --remote-port 9096 --local-log-port 11002 --remote-log-port 10102 --udid <UDID>
-py -m uitap --device 127.0.0.1:19096 status
+python -m uitap tunnel --local-port 19096 --remote-port 9096 --local-log-port 11002 --remote-log-port 10102 --udid <UDID>
+python -m uitap --device 127.0.0.1:19096 status
 ```
 
 这两条命令必须成对理解：`tunnel` 只负责建立端口映射，它**不会**同步修改 `device.address`。改了 `--local-port` 之后，所有业务命令都必须用全局 `--device 127.0.0.1:<新端口>` 指向新的本地端口，否则仍会连到配置文件里的旧地址。
@@ -160,13 +160,13 @@ py -m uitap --device 127.0.0.1:19096 status
 多设备并行时，为每台手机分配互不冲突的本地端口，并各自固定 UDID：
 
 ```bat
-py -m uitap tunnel --udid <UDID-A> --local-port 9096  --local-log-port 10102
-py -m uitap tunnel --udid <UDID-B> --local-port 19096 --local-log-port 11002
-py -m uitap --device 127.0.0.1:9096  status
-py -m uitap --device 127.0.0.1:19096 status
+python -m uitap tunnel --udid <UDID-A> --local-port 9096  --local-log-port 10102
+python -m uitap tunnel --udid <UDID-B> --local-port 19096 --local-log-port 11002
+python -m uitap --device 127.0.0.1:9096  status
+python -m uitap --device 127.0.0.1:19096 status
 ```
 
-需要排查 HTTP 服务而不使用日志时，可传入 `--no-logs`。否则默认应保持 `forward_logs: true`，这样 `py -m uitap log`、`deploy --logs` 和 Python `client.logs()` 都会通过同一条 USB 连接工作。
+需要排查 HTTP 服务而不使用日志时，可传入 `--no-logs`。否则默认应保持 `forward_logs: true`，这样 `python -m uitap log`、`deploy --logs` 和 Python `client.logs()` 都会通过同一条 USB 连接工作。
 
 `tunnel` 在前台运行，按 `Ctrl+C`、向 uitap 进程发送 `SIGTERM` 或发生命令异常时，都会进入清理路径并终止由 uitap 启动的两个 `iproxy` 进程。客户端会在停止后等待本机转发端口重新可绑定，避免紧接着重启隧道时出现短暂端口冲突。不要把这些进程作为后台孤儿任务长期保留。
 
@@ -180,7 +180,7 @@ with Tunnel.from_config(udid="") as tunnel:   # 读取 uitap.json 的 tunnel 段
     print(device.client.status())
 ```
 
-`from_config()` 与 CLI `tunnel` 命令读取同一份配置，优先级为“显式参数 > 配置文件 > 内置默认值”；`with` 退出（包括异常）时自动停止两条映射。配置文件不存在时退回内置默认值，不确定配置是否被读取时可用 `py -m uitap doctor` 检查。
+`from_config()` 与 CLI `tunnel` 命令读取同一份配置，优先级为“显式参数 > 配置文件 > 内置默认值”；`with` 退出（包括异常）时自动停止两条映射。配置文件不存在时退回内置默认值，不确定配置是否被读取时可用 `python -m uitap doctor` 检查。
 
 `Tunnel` 默认同时映射日志端口，因此日志无需额外处理：
 
@@ -212,4 +212,4 @@ with Tunnel.from_config():
 | `log` 失败 | 日志隧道被关闭、端口冲突或设备端日志服务不可用 | 移除 `--no-logs`，确认 `forward_logs` 为 `true`，检查本机 `10102` 与远端 `10102` |
 | 多设备连接到错误手机 | `udid` 留空 | 在配置中固定目标 UDID |
 
-隧道成功只说明本地端口已由 `iproxy` 接管；仍必须执行 `py -m uitap status` 验证设备端服务与目标 App 环境。
+隧道成功只说明本地端口已由 `iproxy` 接管；仍必须执行 `python -m uitap status` 验证设备端服务与目标 App 环境。

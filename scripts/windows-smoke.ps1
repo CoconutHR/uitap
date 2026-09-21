@@ -1,24 +1,16 @@
 [CmdletBinding()]
 param(
-    [switch]$Install
+    [switch]$Install,
+    [string]$Config
 )
 
+# Windows 薄包装：真正的跨平台实现在 scripts/smoke.py，两个平台共用同一份逻辑。
 $ErrorActionPreference = "Stop"
-$ConfigPath = Join-Path $PSScriptRoot "..\tests\integration.json"
 
-if (-not (Test-Path $ConfigPath)) {
-    throw "Missing $ConfigPath. Copy tests\integration.example.json to tests\integration.json, then fill it in."
-}
+$arguments = @((Join-Path $PSScriptRoot "smoke.py"))
+if ($Config) { $arguments += @("--config", $Config) }
+if ($Install) { $arguments += "--install" }
 
-$Config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
-if (-not $Config.enabled) {
-    throw "tests\integration.json has enabled=false. Review the target device and selector, then set enabled=true explicitly."
-}
-
-if ($Install) {
-    py -m pip install --user --upgrade .
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-}
-
-py -m unittest discover -s tests -p test_integration.py -v
+$Python = if (Get-Command py -ErrorAction SilentlyContinue) { "py" } else { "python" }
+& $Python @arguments
 exit $LASTEXITCODE

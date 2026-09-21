@@ -12,7 +12,7 @@
 ## 前置条件
 
 - 手机上已安装并开启设备服务（AScript 应用中的开发者服务），电脑与手机同一网络；USB 场景见下文。
-- Python 3.10+。命令行默认缩写为 `ut`（`uitap` 为全名，二者等价；`py -m uitap` 不依赖 PATH）。
+- Python 3.10+。命令行默认缩写为 `ut`（`uitap` 为全名，二者等价；`python -m uitap` 不依赖 PATH）。
 
 ## 最短上手
 
@@ -121,9 +121,9 @@ edit uitap.json
 ut doctor
 ```
 
-从 PyPI 安装（推荐）：`pip install uitap`；升级用 `pip install --upgrade uitap`。Windows 上 `pip` 未加入 `PATH` 时改用 `py -m pip install uitap`（macOS/Linux 用 `python3 -m pip`）。
+从 PyPI 安装（推荐）：`pip install uitap`；升级用 `pip install --upgrade uitap`。`pip` 未加入 `PATH` 时改用 `python -m pip install uitap`（系统只有 `python3` 时替换为 `python3 -m pip`；Windows 也可用 `py -m pip`）。
 
-源码仓库安装（开发场景）：`py -m pip install --user --upgrade .`，Windows 上推荐 `py -m uitap`（不依赖 `Scripts` 目录是否加入 `PATH`）。真实 `uitap.json` 已被 Git 忽略，其中的密码、UDID 与内网地址不得提交；`init` 在检测到配置未被忽略时会主动警告。
+源码仓库安装（开发场景）：`python -m pip install --user --upgrade .`，改用 `python -m uitap` 调用（Windows 可等价写 `py -m uitap`，不依赖 `Scripts` 目录是否加入 `PATH`）。真实 `uitap.json` 已被 Git 忽略，其中的密码、UDID 与内网地址不得提交；`init` 在检测到配置未被忽略时会主动警告。
 
 需要模板匹配、找图等视觉功能时，改用 `pip install "uitap[vision]"` 一并安装 Pillow 与 OpenCV（`opencv-python-headless`）；OpenCV 用于模糊匹配加速，未安装时自动降级到纯 Pillow 实现，功能不受影响。
 
@@ -220,16 +220,16 @@ with Run(device) as run:
 
 部分 App 或页面不暴露无障碍控件树，此时 Inspector 会正确显示没有语义节点；仍可单独使用截图、OCR、图色与坐标操作。
 
-真机冒烟测试使用独立配置文件，避免环境变量和误操作：
+真机冒烟测试使用独立配置文件，避免环境变量和误操作。跨平台脚本 `scripts/smoke.py` 会先确认 `enabled: true`，再运行只读集成套件（Windows 也可用 `scripts\windows-smoke.ps1` 包装脚本）：
 
 ```bat
 copy tests\integration.example.json tests\integration.json
 edit tests\integration.json
-py -m unittest discover -s tests -p test_integration.py -v
+python scripts/smoke.py --install
 ```
 
-将 `tests\integration.json` 的 `enabled` 显式设为 `true` 后才会连接真机。该套件默认只读取状态、截图、控件树、日志端口和可选选择器，不执行点击、输入、上传、删除或部署。
+等价的直接调用是 `python -m unittest discover -s tests -p test_integration.py -v`。将 `tests\integration.json` 的 `enabled` 显式设为 `true` 后才会连接真机。该套件默认只读取状态、截图、控件树、日志端口和可选选择器，不执行点击、输入、上传、删除或部署。
 
 ## 运行方式与边界
 
-CLI 有三种等价调用：`ut`（默认缩写）、`uitap`（全名）、`py -m uitap`（不依赖 PATH，Windows 推荐）。除模板匹配所需的 Pillow（以及可选的 OpenCV 加速）外，该库只依赖 Python 标准库。生产发布前应在目标 App、目标 iOS 版本和目标设备上执行集成验收；已知的设备端兼容降级见[生产使用指南](docs/生产使用指南.md)。
+CLI 有三种等价调用：`ut`（默认缩写）、`uitap`（全名）、`python -m uitap`（不依赖 PATH，Windows 推荐）。除模板匹配所需的 Pillow（以及可选的 OpenCV 加速）外，该库只依赖 Python 标准库。生产发布前应在目标 App、目标 iOS 版本和目标设备上执行集成验收；已知的设备端兼容降级见[生产使用指南](docs/生产使用指南.md)。

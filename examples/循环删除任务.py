@@ -16,15 +16,15 @@
   （同时装入 OpenCV 加速模糊匹配，未装 OpenCV 时自动降级纯 Pillow）；
 - 需要本机已安装 iproxy（libimobiledevice）并已通过 USB 连接、信任手机；
 - 模板图片「删除.png」「删除该任务.png」放在本脚本同目录，可用
-  ``py -m uitap inspect`` 的「裁剪保存」生成。
+  ``python -m uitap inspect`` 的「裁剪保存」生成。
 
 使用步骤（在仓库根目录执行）：
-1. 准备 uitap.json（``py -m uitap init``），确认真实设备通过 USB
+1. 准备 uitap.json（``python -m uitap init``），确认真实设备通过 USB
    连接且 UDID 已配置；
 2. 将两张模板图片放到 examples/ 目录；
 3. 运行::
 
-       py examples\\循环删除任务.py
+       python examples\\循环删除任务.py
 
 本脚本会真实滑动并点击手机界面，请先在测试设备与测试账号上运行。
 """
@@ -78,7 +78,7 @@ def _check_template(template: Path) -> bool:
         sys.exit(1)
     if not template.is_file():
         print(f"找不到模板图片：{template}")
-        print("请使用 `py -m uitap inspect` 的「裁剪保存」生成对应模板。")
+        print("请使用 `python -m uitap inspect` 的「裁剪保存」生成对应模板。")
         sys.exit(1)
 
 

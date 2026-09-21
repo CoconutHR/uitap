@@ -7,11 +7,11 @@
 
 1. 复制 uitap.example.json 为 uitap.json，填入设备地址（Wi-Fi 为
    手机 IP:9096，USB 隧道为 127.0.0.1:9096）；
-2. 运行 ``py -m uitap inspect``，在目标 App 的登录页确认下面四个占位
+2. 运行 ``python -m uitap inspect``，在目标 App 的登录页确认下面四个占位
    选择器均为“唯一匹配”，再替换为真实值；
 3. 在仓库根目录执行::
 
-       py examples\\完整流程示例.py
+       python examples\\完整流程示例.py
 
 本脚本会真实点击和输入手机界面。请先在测试设备与测试账号上运行，
 不要对生产业务账号执行。

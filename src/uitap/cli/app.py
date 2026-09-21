@@ -34,7 +34,7 @@ def _print_help(topic: str | None = None) -> None:
     if language == "zh":
         print("""uitap 使用帮助
 
-用法：py -m uitap [--config 文件] [--device 地址] [--lang zh-CN|en] <命令>
+用法：python -m uitap [--config 文件] [--device 地址] [--lang zh-CN|en] <命令>
 
 配置文件：默认读取当前目录的 uitap.json。可设置顶层 language 为 auto、zh-CN 或 en。
 
@@ -50,11 +50,11 @@ def _print_help(topic: str | None = None) -> None:
   log        查看日志回显
   tap/tap-rel/swipe/input/home  执行设备操作（需要 --yes）
 
-查看某个命令的详细参数：py -m uitap help <命令>""")
+查看某个命令的详细参数：python -m uitap help <命令>""")
     else:
         print("""uitap usage
 
-Usage: py -m uitap [--config FILE] [--device ADDRESS] [--lang zh-CN|en] <command>
+Usage: python -m uitap [--config FILE] [--device ADDRESS] [--lang zh-CN|en] <command>
 
 Configuration: reads uitap.json from the current directory by default. The top-level language can be auto, zh-CN, or en.
 
@@ -70,7 +70,7 @@ Common commands:
   log        Read log output
   tap/tap-rel/swipe/input/home  Perform device actions (requires --yes)
 
-View command details: py -m uitap help <command>""")
+View command details: python -m uitap help <command>""")
 
 
 def _print_doctor(checks: list[Any]) -> None:

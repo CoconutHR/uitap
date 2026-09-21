@@ -1,4 +1,4 @@
-"""uitap 命令行包：``ut`` / ``uitap`` / ``py -m uitap`` 三个等价入口。"""
+"""uitap 命令行包：``ut`` / ``uitap`` / ``python -m uitap`` 三个等价入口。"""
 from __future__ import annotations
 
 from .app import _stop_tunnel_on_sigterm, main

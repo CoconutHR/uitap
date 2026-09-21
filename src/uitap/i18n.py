@@ -96,8 +96,8 @@ _MESSAGES: dict[str, tuple[str, str]] = {
     "help_usage": ("用法", "Usage"),
     "help_config": ("配置文件", "Configuration"),
     "help_commands": ("常用命令", "Common commands"),
-    "help_more": ("查看某个命令的详细参数：py -m uitap help <命令>", "View a command's arguments: py -m uitap help <command>"),
-    "help_unknown": ("未知命令：{command}。可运行 py -m uitap help 查看可用命令。", "Unknown command: {command}. Run py -m uitap help to list commands."),
+    "help_more": ("查看某个命令的详细参数：python -m uitap help <命令>", "View a command's arguments: python -m uitap help <command>"),
+    "help_unknown": ("未知命令：{command}。可运行 python -m uitap help 查看可用命令。", "Unknown command: {command}. Run python -m uitap help to list commands."),
     "language_invalid": ("language 只能是 'auto'、'zh-CN' 或 'en'", "language must be 'auto', 'zh-CN', or 'en'"),
     "device_address_empty": ("设备地址不能为空", "device address is empty"),
     "device_address_invalid": ("设备地址必须是 HOST[:PORT]", "device address must be HOST[:PORT]"),
@@ -144,8 +144,6 @@ _MESSAGES: dict[str, tuple[str, str]] = {
     "iproxy_missing_linux": ("未找到 iproxy 可执行文件: {executable}。\nLinux：安装发行版提供的 libimobiledevice 包后执行 'command -v iproxy' 验证，或设置 tunnel.iproxy 为绝对路径。", "iproxy executable not found: {executable}.\nLinux: install your distribution's libimobiledevice package and verify with 'command -v iproxy', or set tunnel.iproxy to its absolute path."),
     "tunnel_exited": ("USB 隧道意外退出：{detail}", "USB tunnel exited unexpectedly: {detail}"),
     "tunnel_route_exited": ("{route} 映射已退出（{address} -> 设备:{remote_port}）：{detail}", "{route} forwarding exited ({address} -> device:{remote_port}): {detail}"),
-    "tunnel_executable_deprecated": ("参数 executable 已过时，请改用 iproxy；该别名将在后续版本移除。", "the 'executable' parameter is deprecated; use 'iproxy' instead. The alias will be removed in a future release."),
-    "tunnel_config_conflict": ("executable 与 iproxy 不能同时使用；executable 已过时，请只使用 iproxy。", "'executable' and 'iproxy' cannot be combined; 'executable' is deprecated, use only 'iproxy'."),
     "tunnel_config_unknown": ("from_config 不支持的参数：{keys}。可用参数为 iproxy、local_port、remote_port、local_log_port、remote_log_port、forward_logs、udid、local_host、startup_timeout。", "unsupported from_config parameter(s): {keys}. Supported parameters are iproxy, local_port, remote_port, local_log_port, remote_log_port, forward_logs, udid, local_host, and startup_timeout."),
 }
 

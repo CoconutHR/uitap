@@ -2,7 +2,7 @@
 
 首次使用请先阅读[从零开始使用教程](从零开始使用教程.md)：它按安装、Wi-Fi/USB 连接、Inspector、首个程序、排错和功能示例组织；本文档专注于完整 API 参数、返回值和异常。按任务查找一行写法可先看仓库 [README](../README.md) 的“任务速查”。
 
-本文对应当前主分支 uitap `0.1.0`；除非特别说明，所有调用均为同步调用，失败时抛出 `UitapError` 的子类。生产接入说明见 [生产使用指南](生产使用指南.md)。
+本文对应当前主分支 uitap `0.1.1`；除非特别说明，所有调用均为同步调用，失败时抛出 `UitapError` 的子类。生产接入说明见 [生产使用指南](生产使用指南.md)。
 
 ## 1. 快速选择接口
 
@@ -66,7 +66,7 @@ with Tunnel.from_config() as tunnel:   # 读取 uitap.json 的 tunnel 段
 
 #### `from_config(path=None, **overrides) -> Tunnel`
 
-读取 `uitap.json`（或 `path` 指定的配置文件）的 `tunnel` 段创建隧道；配置文件不存在时退回内置默认值。优先级为“显式参数 > 配置文件 > 内置默认值”，参数名与配置键一致：`iproxy`、`local_port`、`remote_port`、`local_log_port`、`remote_log_port`、`forward_logs`、`udid`、`local_host`、`startup_timeout`。过时别名 `executable` 等效 `iproxy`，使用时发出 `DeprecationWarning`，将在后续版本移除；与 `iproxy` 同时使用或传入未知参数抛出 `ValueError`。
+读取 `uitap.json`（或 `path` 指定的配置文件）的 `tunnel` 段创建隧道；配置文件不存在时退回内置默认值。优先级为“显式参数 > 配置文件 > 内置默认值”，参数名与配置键一致：`iproxy`、`local_port`、`remote_port`、`local_log_port`、`remote_log_port`、`forward_logs`、`udid`、`local_host`、`startup_timeout`。传入未知参数抛出 `ValueError`；旧别名 `executable` 已在 0.1.1 移除，请使用 `iproxy`。
 
 ```python
 # 配置存了设备 A 的 udid 与 iproxy 路径；临时切换设备 B，其余沿用配置。
@@ -301,7 +301,7 @@ for i in range(200):
 1. 电脑上安装标注工具（需先装好 Python）：
 
    ```bash
-   py -m pip install labelImg
+   python -m pip install labelImg
    ```
 
 2. 启动：命令行输入 `labelImg` 回车，会打开一个窗口。
@@ -314,7 +314,7 @@ for i in range(200):
    - 按 `D` 切换下一张，重复直到全部标完。
 7. **记住类别顺序**：第一次保存时 labelImg 会在标注目录生成 `classes.txt`，里面的类别**顺序就是编号顺序**（第一行=0，第二行=1……）。下一步的 `data.yaml` 必须用一模一样的顺序。
 
-标完后每个 `.png` 旁边都有一个同名 `.txt`。然后把数据集按约 9:1 随机拆成训练/验证两份，把下面脚本存为 `split_dataset.py`（与 `dataset` 目录同级）并运行 `py split_dataset.py`：
+标完后每个 `.png` 旁边都有一个同名 `.txt`。然后把数据集按约 9:1 随机拆成训练/验证两份，把下面脚本存为 `split_dataset.py`（与 `dataset` 目录同级）并运行 `python split_dataset.py`：
 
 ```python
 import random, shutil, pathlib
@@ -357,7 +357,7 @@ names:
 **第 3 步：训练（小模型 + 少轮数就能用）。**
 
 ```bash
-py -m pip install ultralytics
+python -m pip install ultralytics
 yolo detect train model=yolo11n.pt data=dataset/data.yaml epochs=80 imgsz=640
 ```
 
@@ -461,7 +461,7 @@ HID JPEG 是有损图像，因此 `confidence=1.0` 的精确匹配仍固定使�
 
 真机 USB 验证（iPhone / iOS 26.6.1 / AScript 4001）中，HID JPEG 的获取与 Pillow 解码中位约 `81ms`，完整 PNG 截图回传中位约 `406ms`；在实际删除任务轮询脚本的稳定热态下，单次模板查询约 `73–126ms`，原 PNG 路径约 `200–250ms`。这些是特定设备、模板和 USB 环境的观测值，而不是跨设备性能承诺。生产脚本应使用同一分辨率、方向和 UI 缩放条件截取模板，为 JPEG 匹配选择经实机验证的阈值，并用 `region` / `region_relative` 限制搜索范围。
 
-单模板和所有图像等待/点击/滚动 API 都可用物理像素 `region=(left, top, right, bottom)` 或比例 `region_relative=(left, top, right, bottom)` 限制搜索区域，两者不能同时传入。多模板接口（`find_images()`、`find_any_image()`、`wait_any_image()`）额外支持按模板名称映射的 `regions` / `regions_relative` / `regions_pixels`，让每张模板拥有各自的搜索区域；同时也可以直接传单数 `region` / `region_relative` / `region_pixels`，作为全部模板共用的默认区域。同一模板同时给出两者时，按名称的映射优先于默认区域。旧 `region_pixels` / `regions_pixels` 是物理像素弃用别名，会发出 `DeprecationWarning`。旧版比例 `region` 仅在包含非整数时暂时兼容并发出警告；尤其旧全屏写法 `region=(0, 0, 1, 1)` 必须改为 `region_relative=(0, 0, 1, 1)`，因为新规则下它表示 1×1 物理像素区域。
+单模板和所有图像等待/点击/滚动 API 都可用物理像素 `region=(left, top, right, bottom)` 或比例 `region_relative=(left, top, right, bottom)` 限制搜索区域，两者不能同时传入；`region` 必须是四个整数，传入比例数值会直接抛出 `ValueError`，请改用 `region_relative`。多模板接口（`find_images()`、`find_any_image()`、`wait_any_image()`）额外支持按模板名称映射的 `regions` / `regions_relative`，让每张模板拥有各自的搜索区域；同时也可以直接传单数 `region` / `region_relative`，作为全部模板共用的默认区域。同一模板同时给出两者时，按名称的映射优先于默认区域。旧 `region_pixels` / `regions_pixels` 别名已在 0.1.1 移除，请统一使用 `region` / `regions`；注意旧全屏写法 `region=(0, 0, 1, 1)` 表示的是 1×1 物理像素区域，全屏请写 `region_relative=(0, 0, 1, 1)`。
 
 ```python
 match = client.find_image("assets/login-icon.png", confidence=0.95)
