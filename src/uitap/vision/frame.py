@@ -51,6 +51,34 @@ def relative_point(width: int, height: int, x_ratio: float, y_ratio: float) -> t
         raise ValueError("relative coordinates must be finite numbers between 0 and 1")
     return min(width - 1, int(width * x_ratio)), min(height - 1, int(height * y_ratio))
 
+def resolve_region(width: int | None, height: int | None, *, region: tuple[int, int, int, int] | None = None, region_relative: tuple[float, float, float, float] | None = None) -> tuple[int, int, int, int]:
+    """把搜索区域解析为物理像素矩形 ``(left, top, right, bottom)``。
+
+    本机视觉与设备端图色/OCR/检测共用这一套校验：``region`` 为物理像素整数，
+    ``region_relative`` 为 ``0..1`` 比例，两者不能同时传入。比例换算与全屏区域
+    需要 ``width``/``height``；只给绝对像素 ``region`` 时尺寸可以传 ``None``，
+    此时跳过屏幕边界校验——调用方没有现成帧时，不必为了量尺寸多抓一帧。
+    """
+    if region is not None and region_relative is not None: raise ValueError("region and region_relative cannot be combined")
+    if region_relative is not None:
+        if width is None or height is None: raise ValueError("region_relative requires the screen size")
+        try: left, top, right, bottom = (float(value) for value in region_relative)
+        except (TypeError, ValueError) as exc: raise ValueError("region_relative must contain four ratios") from exc
+        if not all(math.isfinite(value) and 0 <= value <= 1 for value in (left, top, right, bottom)) or left >= right or top >= bottom:
+            raise ValueError("region_relative must satisfy 0 <= left < right <= 1 and 0 <= top < bottom <= 1")
+        return int(width * left), int(height * top), max(int(width * right), int(width * left) + 1), max(int(height * bottom), int(height * top) + 1)
+    if region is None:
+        if width is None or height is None: raise ValueError("a full-screen region requires the screen size")
+        return 0, 0, width, height
+    if len(region) != 4: raise ValueError("region must contain four physical pixel coordinates")
+    if not all(isinstance(value, int) for value in region):
+        raise ValueError("region must be four physical pixel integers; pass ratios as region_relative=(left, top, right, bottom)")
+    left, top, right, bottom = region
+    if left >= right or top >= bottom: raise ValueError("region must satisfy left < right and top < bottom")
+    if width is not None and height is not None and not (0 <= left < right <= width and 0 <= top < bottom <= height):
+        raise ValueError("region must satisfy screen bounds and left < right, top < bottom")
+    return region
+
 class ScreenFrame:
     """One immutable device screenshot using physical-pixel coordinates."""
     def __init__(self, png: bytes):
@@ -107,28 +135,14 @@ class ScreenFrame:
         return actual
 
     def resolve_region(self, *, region: tuple[int, int, int, int] | None = None, region_relative: tuple[float, float, float, float] | None = None) -> tuple[int, int, int, int]:
-        """把搜索区域解析为物理像素矩形 ``(left, top, right, bottom)``。
+        """用当前帧尺寸解析搜索区域，返回物理像素矩形。
 
-        ``region`` 为物理像素整数，``region_relative`` 为 ``0..1`` 比例，两者
-        不能同时传入。参数只接受关键字，避免跨模块调用时因参数顺序或个数
-        变化而静默错位（0.1.1 的裁剪/OCR 回归正是私有方法被跨模块按位置调用
-        且签名收窄造成的）。
+        与模块级 :func:`resolve_region` 共用同一套校验，只是拿当前帧的宽高做
+        比例换算与屏幕边界检查。参数只接受关键字，避免跨模块调用时因参数顺序
+        或个数变化而静默错位（0.1.1 的裁剪/OCR 回归正是私有方法被跨模块按位置
+        调用且签名收窄造成的）。
         """
-        if region is not None and region_relative is not None: raise ValueError("region and region_relative cannot be combined")
-        if region_relative is not None:
-            try: left, top, right, bottom = (float(value) for value in region_relative)
-            except (TypeError, ValueError) as exc: raise ValueError("region_relative must contain four ratios") from exc
-            if not all(math.isfinite(value) and 0 <= value <= 1 for value in (left, top, right, bottom)) or left >= right or top >= bottom:
-                raise ValueError("region_relative must satisfy 0 <= left < right <= 1 and 0 <= top < bottom <= 1")
-            return int(self.width * left), int(self.height * top), max(int(self.width * right), int(self.width * left) + 1), max(int(self.height * bottom), int(self.height * top) + 1)
-        if region is None: return 0, 0, self.width, self.height
-        if len(region) != 4: raise ValueError("region must contain four physical pixel coordinates")
-        if not all(isinstance(value, int) for value in region):
-            raise ValueError("region must be four physical pixel integers; pass ratios as region_relative=(left, top, right, bottom)")
-        left, top, right, bottom = region
-        if not (0 <= left < right <= self.width and 0 <= top < bottom <= self.height):
-            raise ValueError("region must satisfy screen bounds and left < right, top < bottom")
-        return region
+        return resolve_region(self.width, self.height, region=region, region_relative=region_relative)
 
     @staticmethod
     def _template(template: str | Path | bytes):

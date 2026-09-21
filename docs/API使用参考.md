@@ -238,6 +238,8 @@ assert app["bundle_id"] == "com.example.app"
 | `find_sift(templates, *, threshold=0.5, rgb=False, max_res=0, region=None, region_relative=None)` | SIFT 特征匹配（设备端原生 OpenCV），抗尺度/光照变化；`templates` 为**设备端**小图路径列表，结果坐标为截图像素并已叠加 region 偏移 |
 | `scan_code(*, region=None, region_relative=None)` | 二维码/条码识别（设备端原生 MLKitx），返回值/类型/矩形/中心 |
 
+上述设备端检测接口（`find_sift` / `scan_code` / `yolov_detect`）的 `region` / `region_relative` 与本机视觉共用同一套解析与校验（`uitap.vision.resolve_region`）：`region` 必须是四个物理像素整数且满足 `left < right`、`top < bottom`，比例搜索必须走 `region_relative`，传比例数值给 `region` 会直接抛 `ValueError`。只传绝对 `region` 时不会再额外抓一帧量尺寸；传 `region_relative` 或省略区域（全屏）时才读取一次屏幕尺寸。
+
 ### YOLO 目标检测（ncnn）
 
 设备端内置 ncnn 推理引擎（支持 YOLOv8/v11）。检测"一类"目标而非固定图片，对缩放/形变/光照鲁棒，推理在手机本地毫秒级完成。

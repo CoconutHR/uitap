@@ -154,6 +154,58 @@ class TreeAndDetectTests(_FakeScreen):
         self.assertEqual(seen, [{"region": (1, 2, 3, 4)}])
 
 
+class DetectRegionTests(_FakeScreen):
+    """设备端检测 API 的区域解析：与 ScreenFrame.resolve_region 共用一套语义。"""
+
+    def setUp(self):
+        super().setUp()
+        self.captured: list[str] = []
+        self.client.eval_python = lambda code: self.captured.append(code) or []
+        self.size_calls = 0
+
+    def _measure(self, width=1000.0, height=2000.0):
+        def action_size():
+            self.size_calls += 1
+            return {"width": width, "height": height}
+        self.client.action_size = action_size
+
+    def _forbid_measure(self):
+        def action_size():
+            raise AssertionError("绝对像素 region 不应触发本机抓帧")
+        self.client.action_size = action_size
+
+    def test_absolute_region_skips_the_host_capture(self):
+        self._forbid_measure()
+        self.client.scan_code(region=(10, 20, 30, 40))
+        self.assertIn("capture(rect=(10, 20, 30, 40))", self.captured[-1])
+        self.client.yolov_detect(region=(1, 2, 3, 4))
+        self.assertIn("rect=[1, 2, 3, 4]", self.captured[-1])
+
+    def test_relative_and_full_screen_regions_measure_once(self):
+        self._measure()
+        self.client.scan_code(region_relative=(0, 0, 0.5, 0.5))
+        self.assertIn("capture(rect=(0, 0, 500, 1000))", self.captured[-1])
+        self.client.scan_code()
+        self.assertIn("capture(rect=(0, 0, 1000, 2000))", self.captured[-1])
+        self.assertEqual(self.size_calls, 2)
+
+    def test_detect_and_vision_share_one_region_resolver(self):
+        from uitap.vision import resolve_region
+
+        self._measure()
+        self.client.find_sift(["~/res/img/a.png"], region_relative=(0.1, 0.2, 0.5, 0.6))
+        expected = resolve_region(1000, 2000, region_relative=(0.1, 0.2, 0.5, 0.6))
+        self.assertIn(f"capture(rect={expected})", self.captured[-1])
+
+    def test_detect_regions_reject_input_the_vision_resolver_rejects(self):
+        self._measure()
+        with self.assertRaises(ValueError): self.client.scan_code(region=(0, 0, 1, 1), region_relative=(0, 0, 1, 1))
+        with self.assertRaises(ValueError): self.client.scan_code(region=(0, 0, 0.5, 0.5))          # 比例数值必须走 region_relative
+        with self.assertRaises(ValueError): self.client.scan_code(region=(100, 200, 50, 60))          # left >= right
+        with self.assertRaises(ValueError): self.client.scan_code(region_relative=(0.5, 0.5, 0.5, 0.5))  # 退化区域
+        with self.assertRaises(ValueError): self.client.scan_code(region_relative=(0, 0, 1.5, 1))
+
+
 class SelectorBuilderTests(unittest.TestCase):
     def test_state_and_limit_builders_encode_the_device_payload(self):
         selector = Selector().visible().selected(False).focused(True).traits(3).child_count(2).with_limits(max_depth=5, max_children=7)

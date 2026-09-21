@@ -13,19 +13,6 @@ class OcrMixin:
     """设备端图色引擎与 OCR。"""
 
 
-    def _resolve_capture_region(self, region: Any, region_relative: Any) -> tuple[int, int, int, int]:
-        if region is not None and region_relative is not None: raise ValueError("region and region_relative cannot be combined")
-        size = self.action_size()
-        width, height = float(size["width"]), float(size["height"])
-        if region_relative is not None:
-            l_ratio, t_ratio, r_ratio, b_ratio = (float(value) for value in region_relative)
-            if not all(0 <= value <= 1 for value in (l_ratio, t_ratio, r_ratio, b_ratio)): raise ValueError("region_relative values must be within 0..1")
-            return round(l_ratio * width), round(t_ratio * height), round(r_ratio * width), round(b_ratio * height)
-        if region is not None:
-            left, top, right, bottom = (int(value) for value in region)
-            return left, top, right, bottom
-        return 0, 0, int(width), int(height)
-
     def _device_screenshot_path(self) -> str:
         items = self._ok(self.json("GET", "/api/screen/capture/list", params={"capture": "true"})).get("data") or []
         if not items:

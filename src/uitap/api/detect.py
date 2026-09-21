@@ -4,9 +4,24 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ..vision import resolve_region
+
 
 class DetectMixin:
     """设备端 SIFT / 二维码 / YOLO 识别。"""
+
+
+    def _capture_rect(self, region: Any, region_relative: Any) -> tuple[int, int, int, int]:
+        """解析设备端 ``capture(rect=...)`` 的矩形。
+
+        与 :meth:`uitap.vision.ScreenFrame.resolve_region` 共用同一套校验；
+        只有比例输入才需要先在本机抓一帧量屏幕尺寸，纯物理像素 ``region``
+        不再额外抓屏。
+        """
+        if region is not None and region_relative is not None: raise ValueError("region and region_relative cannot be combined")
+        if region is not None: return resolve_region(None, None, region=region)
+        size = self.action_size()
+        return resolve_region(int(size["width"]), int(size["height"]), region_relative=region_relative)
 
 
     def find_sift(self, templates: Any, *, threshold: float = 0.5, rgb: bool = False, max_res: int = 0, region: Any = None, region_relative: Any = None) -> list[dict[str, Any]]:
@@ -19,7 +34,7 @@ class DetectMixin:
         if not templates: raise ValueError("templates must be a non-empty sequence of device-side paths")
         paths = [str(item) for item in templates]
         if not 0 < float(threshold) <= 1: raise ValueError("threshold must be within (0, 1]")
-        left, top, right, bottom = self._resolve_capture_region(region, region_relative)
+        left, top, right, bottom = self._capture_rect(region, region_relative)
         code = (
             "import json\n"
             "from ascript.ios.screen import capture\n"
@@ -34,7 +49,7 @@ class DetectMixin:
     def scan_code(self, *, region: Any = None, region_relative: Any = None) -> list[dict[str, Any]]:
         """二维码/条码识别（设备端原生 MLKitx）。返回 ``[{"result": (x, y), "rect",
         "center_x", "center_y", "value", "type", "format"}]``，坐标为截图像素。"""
-        left, top, right, bottom = self._resolve_capture_region(region, region_relative)
+        left, top, right, bottom = self._capture_rect(region, region_relative)
         code = (
             "import json\n"
             "from ascript.ios.screen import capture\n"
@@ -70,7 +85,7 @@ class DetectMixin:
         if not 0 <= float(nms_threshold) <= 1: raise ValueError("nms_threshold must be within 0..1")
         rect = "None"
         if region is not None or region_relative is not None:
-            left, top, right, bottom = self._resolve_capture_region(region, region_relative)
+            left, top, right, bottom = self._capture_rect(region, region_relative)
             rect = json.dumps([left, top, right, bottom])
         code = (
             "import json\n"
