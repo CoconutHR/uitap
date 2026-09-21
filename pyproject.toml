@@ -27,7 +27,7 @@ dependencies = []
 
 [project.optional-dependencies]
 vision = ["Pillow>=9.0", "opencv-python-headless>=4.5"]
-dev = ["pyflakes>=3.2", "build>=1.2"]
+dev = ["pyflakes>=3.2", "build>=1.2", "tomli>=2; python_version < '3.11'"]
 
 [project.urls]
 Homepage = "https://github.com/CoconutHR/uitap"
