@@ -13,6 +13,7 @@ python -m pip install -e ".[dev,vision]"  # 本地开发安装（含 pyflakes / 
 python -m unittest discover -s tests -v   # 全部单元测试；真机集成测试默认禁用
 python -m pyflakes src/uitap              # 静态检查（未定义名/未用导入）
 python scripts/version_sync.py            # 发布元数据三处版本一致性（测试也会强制）
+python scripts/api_docs_sync.py           # 公开 API 文档覆盖 + API 面快照一致性（测试也会强制）
 python scripts/smoke.py                   # 真机只读冒烟（需 tests/integration.json 且 enabled: true）
 ut help                                   # CLI 速查（python -m uitap 完全等价）
 ```

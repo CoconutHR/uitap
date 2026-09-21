@@ -15,13 +15,14 @@
 - 需要 Pillow 支持模板匹配，安装 ``pip install "uitap[vision]"``
   （同时装入 OpenCV 加速模糊匹配，未装 OpenCV 时自动降级纯 Pillow）；
 - 需要本机已安装 iproxy（libimobiledevice）并已通过 USB 连接、信任手机；
-- 模板图片「删除.png」「删除该任务.png」放在本脚本同目录，可用
+- 模板图片「删除.png」「删除该任务.png」放在 ``examples/assets/`` 目录（该目录
+  已在 ``.gitignore`` 中保留例外，便于把脱敏/可复用的模板入库），可用
   ``python -m uitap inspect`` 的「裁剪保存」生成。
 
 使用步骤（在仓库根目录执行）：
 1. 准备 uitap.json（``python -m uitap init``），确认真实设备通过 USB
    连接且 UDID 已配置；
-2. 将两张模板图片放到 examples/ 目录；
+2. 将两张模板图片放到 examples/assets/ 目录；
 3. 运行::
 
        python examples\\循环删除任务.py
@@ -48,9 +49,10 @@ SWIPE_END_X, SWIPE_END_Y = 300, 400
 # top<bottom，故规范化为 min/max 对角点后，左边界 left 再减 100。
 REGION = (800, 320, 1150, 550)
 
-# 模板图片路径（相对本脚本所在目录）
-DELETE_IMAGE = Path(__file__).with_name("删除.png")
-DELETE_TASK_IMAGE = Path(__file__).with_name("删除该任务.png")
+# 模板图片路径（相对本脚本所在目录的 assets/ 子目录；该目录有 .gitignore 例外）
+ASSETS = Path(__file__).with_name("assets")
+DELETE_IMAGE = ASSETS / "删除.png"
+DELETE_TASK_IMAGE = ASSETS / "删除该任务.png"
 
 # 模板匹配置信度阈值。
 # 模板是从当前界面精确裁剪的，0.95 会先走字节级精确匹配（_find_exact），

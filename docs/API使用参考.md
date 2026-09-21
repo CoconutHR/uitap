@@ -74,7 +74,7 @@ with Tunnel.from_config(udid="设备B的UDID") as tunnel:
     device = connect(tunnel.address)
 ```
 
-直接构造 `Tunnel(...)` 不读取配置文件，字段名也与配置键不同（`executable` 对应 `iproxy`），仅用于完全显式控制的场景。可配置 `local_port`、`remote_port`、`local_log_port`、`remote_log_port`、`udid`、`executable`、`local_host` 和 `startup_timeout`。`forward_logs=False` 只映射 HTTP 服务。`.address` 是 HTTP 客户端地址，`.log_address` 是日志地址或 `None`，`.start()` / `.stop()` 管理两条映射的生命周期。
+直接构造 `Tunnel(...)` 不读取配置文件，字段名也与配置键不同（`executable` 对应 `iproxy`），仅用于完全显式控制的场景。可配置 `local_port`、`remote_port`、`local_log_port`、`remote_log_port`、`udid`、`executable`、`local_host` 和 `startup_timeout`。`forward_logs=False` 只映射 HTTP 服务。`.address` 是 HTTP 客户端地址，`.log_address` 是日志地址或 `None`，`.start()` / `.stop()` 管理两条映射的生命周期；异常退出后可调用 `.exit_summary()` 取得包含 iproxy stderr 摘要的停止原因描述。
 
 ### `IProxyTunnel`
 
@@ -431,7 +431,7 @@ button = client.screenshot_crop(0, 1800, 1179, 2556)
 client.save_screenshot_crop("artifacts/bottom.png", 0, 1800, 1179, 2556)
 ```
 
-实现无第三方依赖，支持移动端截图使用的非隔行 8 位 RGB/RGBA PNG；非标准 PNG 会抛出 `DeviceResponseError`。已有截图字节需要按物理像素矩形复用时，可调用 `Client.crop_png(image, left, top, right, bottom)`；矩形同样采用左上包含、右下排除。
+实现无第三方依赖，支持移动端截图使用的非隔行 8 位 RGB/RGBA PNG；非标准 PNG 会抛出 `DeviceResponseError`。已有截图字节需要按物理像素矩形复用时，可调用 `Client.crop_png(image, left, top, right, bottom)`；按比例复用时调用 `Client.crop_png_relative(image, left, top, right, bottom)`（比例单位为 `0..1`）。矩形同样采用左上包含、右下排除。
 
 ### `capture_frame()`、`pixel()` 与 `pixels()`
 
@@ -703,8 +703,9 @@ submit.get().click()
 
 `Device` 也直接暴露以下方法，语义与 `Client` 同名方法完全一致：
 
-- 绝对物理像素：`tap()`、`swipe()`、`pixel()`、`pixels()`、`screenshot_crop()`、`save_screenshot_crop()`；
-- 比例坐标：`click_relative()` / `click_rel()`、`swipe_relative()`、`pixel_relative()`、`pixels_relative()`、`screenshot_crop_relative()`、`save_screenshot_crop_relative()`；
+- 绝对物理像素：`tap()`、`swipe()`、`pixel()`、`pixels()`、`screenshot_crop()`、`save_screenshot_crop()`、`long_press()`、`double_tap()`、`drag()`；
+- 比例坐标：`click_relative()` / `click_rel()`、`swipe_relative()`、`pixel_relative()`、`pixels_relative()`、`screenshot_crop_relative()`、`save_screenshot_crop_relative()`、`long_press_relative()`、`double_tap_relative()`、`drag_relative()`；
+- 颜色：`color_matches()`、`color_matches_relative()`、`assert_color()`、`assert_color_relative()`；
 - 视觉：`capture_frame()`、`find_image()`、`find_images()`、`find_any_image()`、`wait_image()`、`wait_any_image()`、`wait_image_gone()`、`tap_image()`、`scroll_until_image()`。
 
 ### `Selector`
@@ -736,6 +737,7 @@ cancel = base.name("cancel_button")
 | `.traits(value)` | 按可访问性 traits 位匹配 |
 | `.child_count(value)` | 按直接子节点数匹配 |
 | `.with_limits(max_depth=0, max_children=30)` | 设置服务端树查询上限；`0` 交由服务端按不限处理 |
+| `.with_attr(key, value, match=EQUAL)` | 底层入口：按任意受支持字段追加条件；`key` 不合法抛 `ValueError`，上层具名方法都由它派生 |
 | `.payload(find=99999)` | 返回设备端 selector JSON；仅调试/互操作使用 |
 | `.code()` | 返回可读的 Python 选择器代码字符串 |
 
@@ -776,8 +778,8 @@ submit.click()
 | `.click()` | 以矩形中心的物理像素点击；空矩形抛 `ValueError` |
 | `.click_relative(x_ratio, y_ratio)` | 按元素矩形比例点击；`(0, 0)` 为左上、`(1, 1)` 为矩形内最后一个有效像素 |
 | `.set_text(text, interval_ms=120)` | 先点选再输入 |
-| `.get_text() -> str` | 从设备端读取元素权威文本（需元素携带 `id`；真机已验证）。注意：`clear_text` 在该设备的 noWDA 实现上不可用——原生 `/clear`、`/value`、HID 删除键、退格符与原生元素查找均无效（已逐项真机确认），如需清空请用业务层 `.set_text` 覆盖或重新加载页面 |
-| `.scroll(direction="down", distance=1.0)` | 在可滚动元素内滚动；`direction`：up/down/left/right，`distance` 为元素宽高倍数（真机已验证） |
+| `.get_text() -> str` | 从设备端读取元素权威文本（需元素携带 `id`；真机已验证），底层调用 `Client.element_text(node_id)`。注意：`clear_text` 在该设备的 noWDA 实现上不可用——原生 `/clear`、`/value`、HID 删除键、退格符与原生元素查找均无效（已逐项真机确认），如需清空请用业务层 `.set_text` 覆盖或重新加载页面 |
+| `.scroll(direction="down", distance=1.0)` | 在可滚动元素内滚动，底层调用 `Client.element_scroll(node_id, direction, distance)`；`direction`：up/down/left/right，`distance` 为元素宽高倍数（真机已验证） |
 | `.scroll_to(selector, *, direction="down", max_swipes=8, distance=0.8, interval=0.3)` | 在该元素内边滚边找目标；找到返回 `UiObject`，超过 `max_swipes` 返回 `None`。`UiCollection` 提供同名委托 |
 
 `UiObject` 是快照，不会在页面跳转后自动重新定位。页面发生变化后请重新使用 `UiCollection.get()` 或 `device.find()` 查询。
@@ -953,6 +955,7 @@ frame = client.capture_frame()
 point = frame.find_color("#FF0000", region=(0, 1800, 1179, 2556))
 count = frame.count_color((255, 255, 255), region_relative=(0, 0.7, 1, 1))
 frame.assert_color(100, 200, "#FFFFFF")
+frame.assert_color_relative(0.5, 0.5, "#FFFFFF")
 ```
 
 ### `find_colors(colors, *, diff=0.98) -> Any`

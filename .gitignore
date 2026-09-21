@@ -7,8 +7,12 @@ dist/
 venv/
 .pytest_cache/
 .coverage
+# 截图、控件树与证据产物默认不入库（避免真机画面与隐私进入版本库）
 *.png
 *.xml
+# 例外：示例脚本的可复用模板目录。只放脱敏/合成的模板，不要放真机截图。
+!examples/assets/
+!examples/assets/*.png
 uitap.json
 tests/integration.json
 artifacts/

@@ -39,7 +39,7 @@ class OcrMixin:
     def ocr_raw(self, *, region: tuple[int, int, int, int] | None = None, region_relative: tuple[float, float, float, float] | None = None) -> Any:
         if region is not None and region_relative is not None: raise ValueError("region and region_relative cannot be combined")
         if region_relative is not None:
-            frame = self.capture_frame(); left, top, right, bottom = frame._region(None, region_relative, None); region = (left, top, right, bottom)
+            frame = self.capture_frame(); left, top, right, bottom = frame._region(None, region_relative); region = (left, top, right, bottom)
         rect = "|".join(str(value) for value in region) if region else None
         return self.gp("ascript.ios.screen.Ocr", "mode=5, confidence=0.1" + (f", rect=[{rect}]" if rect else ""))
 

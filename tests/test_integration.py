@@ -13,6 +13,7 @@ from pathlib import Path
 
 from uitap import Client
 from uitap.config import device_options, load_config
+from uitap.core.png import png_size
 
 
 CONFIG_PATH = Path(__file__).with_name("integration.json")
@@ -44,6 +45,13 @@ class DeviceIntegrationTests(unittest.TestCase):
         (self.artifacts / "tree.xml").write_text(xml, encoding="utf-8")
         self.assertTrue(image.startswith(b"\x89PNG\r\n\x1a\n"), "device did not return a PNG screenshot")
         self.assertIn("<", xml)
+        # 相对裁剪在本机完成：它曾在 0.1.1 因内部签名收窄而回归，这里做端到端复验。
+        crop = self.client.screenshot_crop_relative(0, 0, 0.5, 0.5)
+        (self.artifacts / "screen_crop_half.png").write_bytes(crop)
+        crop_width, crop_height = png_size(crop)
+        source_width, source_height = png_size(image)
+        self.assertLessEqual(abs(crop_width - source_width / 2), 1, "relative crop should cover about half the source width")
+        self.assertLessEqual(abs(crop_height - source_height / 2), 1, "relative crop should cover about half the source height")
 
     def test_03_log_socket(self):
         # Empty output is valid on an idle device; establishing and closing the

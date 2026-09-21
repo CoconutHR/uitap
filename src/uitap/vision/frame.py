@@ -80,7 +80,7 @@ class ScreenFrame:
         return output.getvalue()
 
     def crop_relative(self, left: float, top: float, right: float, bottom: float) -> bytes:
-        x0, y0, x1, y1 = self._region(None, (left, top, right, bottom), None)
+        x0, y0, x1, y1 = self._region(None, (left, top, right, bottom))
         x1, y1 = max(x1, x0 + 1), max(y1, y0 + 1)
         return self.crop_pixels(x0, y0, min(self.width, x1), min(self.height, y1))
 
